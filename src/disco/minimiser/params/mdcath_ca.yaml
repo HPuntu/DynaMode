@@ -1,0 +1,64 @@
+# CA-only analogue of aSAM2's mdCATH minimisation protocol.
+#
+# aSAM2's all-atom minimizer works in nm and uses atom14 force-field terms.
+# These values are converted/adapted to Angstrom CA traces:
+#   cabl_init_range [0.357, 0.411] nm -> [3.57, 4.11] A
+#   nb_centers_threshold 1.0 nm -> 10.0 A
+
+data:
+  batch_size: 50
+
+top:
+  min_sep: 2
+  min_segment_sep: 2
+  nb_centers_threshold: 10.0
+
+opt:
+  opt: lbfgs
+  step_size: 1.0
+  steps: 30
+  max_iter: 10
+  history_size: 100
+  nb_update_freq: 10
+  nb_centers_threshold: 10.0
+  bond_init_range: [3.57, 4.11]
+  bond_target: 3.8
+  bond_target_mode: initial_in_range_else_ideal
+  energy_params:
+    bond_const: 10000
+    angle_const: 100
+    dihedral_const: 10
+    nb_const: 250
+    nb_form: l2
+    nb_threshold: 3.5
+    # Optional chain segment self-intersection penalty. Keep off by default:
+    # it scales with segment pairs and is much slower than the CA-CA clash term.
+    segment_const: 0
+    segment_form: l2
+    segment_threshold: 1.0
+    early_stopping_clash_score: 0.7
+    early_stopping_clash_thresh: 3.5
+
+opt_ini:
+  opt: adam
+  step_size: 0.001
+  steps: 50
+  beta1: 0.5
+  beta2: 0.9
+  nb_update_freq: 10
+  nb_centers_threshold: 10.0
+  bond_init_range: [3.57, 4.11]
+  bond_target: 3.8
+  bond_target_mode: initial_in_range_else_ideal
+  energy_params:
+    bond_const: 10000
+    angle_const: 100
+    dihedral_const: 10
+    nb_const: 100
+    nb_form: l2
+    nb_threshold: 3.5
+    segment_const: 0
+    segment_form: l2
+    segment_threshold: 1.0
+    early_stopping_clash_score: 0.7
+    early_stopping_clash_thresh: 3.5
