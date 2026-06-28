@@ -1,9 +1,9 @@
 # DynaMode: Generative Protein Dynamics with Spectral Diffusion
 
-[![ICML 2026 GenBio Workshop](https://img.shields.io/badge/ICLR-2026-blue.svg)](https://openreview.net/forum?id=0Cy0I8B9O2) 
+[![ICML 2026 GenBio Workshop](https://img.shields.io/badge/ICML-2026-blue.svg)](https://openreview.net/forum?id=0Cy0I8B9O2) 
 
 <p align="center">
-  <img src="assets/dynamode.png" alt="DynaMode" width="100%">
+  <img src="assets/DynaMode.png" alt="DynaMode" width="100%">
 </p>
 
 Official implementation of [**DynaMode** (Spectral Diffusion for Protein Dynamics)](https://openreview.net/forum?id=0Cy0I8B9O2) accepted at ICML 2026 GenBio workshop. DynaMode is a  diffusion model trained on mdCATH to sample temporally coherent 256 frame (256ns) $C_\alpha$ monomer protein trajectories given an input structure and temperature. Diffusion in the DCT transformed spectral domain over the time domain leads to faster improved dynamics prediction over existing methods.
