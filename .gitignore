@@ -1,4 +1,5 @@
 data
 checkpoints
 .env
-configs
+__pycache__/
+*.py[cod]

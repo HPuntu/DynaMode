@@ -1,0 +1,105 @@
+# CA-only analogue of aSAM2's mdCATH minimisation protocol.
+#
+# aSAM2's all-atom minimizer works in nm and uses atom14 force-field terms.
+# These values are converted/adapted to Angstrom CA traces. Length-squared
+# force constants from the nm-space aSAM2 protocol are scaled down for
+# Angstrom coordinates, and bad initial CA bonds are masked instead of being
+# pulled to an ideal value with a giant spring:
+#   cabl_init_range [0.357, 0.411] nm -> [3.57, 4.11] A.
+#   We use a slightly wider active-restraint window [3.20, 4.60] A to keep
+#   moderately noisy generated CA bonds stable without trying to repair
+#   genuinely broken topology.
+#   nb_centers_threshold 1.0 nm -> 10.0 A
+#
+# Current default is strong clash-focused: generated CA bonds are usually
+# already sane, so the minimiser mainly resolves steric/nonlocal trace
+# contacts while keeping bond/angle/dihedral terms as conservative shape
+# restraints. Clash terms are normalised by active violations, not all
+# possible pairs, so rare bad contacts are not numerically washed out.
+# If a clash-relief step would create a bad adjacent CA-CA bond, the affected
+# frame is rolled back to its previous valid coordinates and frozen for the
+# rest of that stage; other frames in the batch keep minimising.
+
+data:
+  batch_size: 25
+
+top:
+  min_sep: 2
+  min_segment_sep: 2
+  nb_centers_threshold: 12.0
+
+opt:
+  opt: lbfgs
+  step_size: 0.1
+  steps: 15
+  max_iter: 5
+  history_size: 100
+  line_search_fn: strong_wolfe
+  nb_update_freq: 10
+  nb_centers_threshold: 12.0
+  bond_init_range: [3.20, 4.60]
+  bond_target: 3.8
+  bond_target_mode: initial_in_range_else_ignore
+  gradient_clip: 100.0
+  gradient_clip_mode: norm
+  max_step_displacement: 0.35
+  rollback_on_energy_increase: true
+  energy_increase_tolerance: 10.0
+  max_abs_coord: 1000.0
+  min_caca_bond: 1.0
+  max_caca_bond: 10.0
+  caca_bond_guard_tolerance: 0.0
+  energy_params:
+    bond_const: 1000
+    angle_const: 100
+    dihedral_const: 10
+    nb_const: 25.0
+    nb_form: l2
+    nb_threshold: 4.0
+    nb_normalize_by: active
+    # Optional chain segment self-intersection penalty. This is stronger than
+    # the first safe minimiser, but still guarded by rollback and per-step
+    # displacement caps so it nudges clashes rather than rewiring topology.
+    segment_const: 50.0
+    segment_form: l2
+    segment_threshold: 2.0
+    segment_normalize_by: active
+    early_stopping_clash_score: null
+    early_stopping_clash_thresh: 3.5
+    normalize_energy: true
+
+opt_ini:
+  opt: adam
+  step_size: 0.001
+  steps: 80
+  beta1: 0.5
+  beta2: 0.9
+  nb_update_freq: 10
+  nb_centers_threshold: 12.0
+  bond_init_range: [3.20, 4.60]
+  bond_target: 3.8
+  bond_target_mode: initial_in_range_else_ignore
+  gradient_clip: 100.0
+  gradient_clip_mode: norm
+  max_step_displacement: 0.35
+  rollback_on_energy_increase: true
+  energy_increase_tolerance: 10.0
+  max_abs_coord: 1000.0
+  min_caca_bond: 1.0
+  max_caca_bond: 10.0
+  caca_bond_guard_tolerance: 0.0
+  energy_params:
+    bond_const: 1000
+    angle_const: 100
+    dihedral_const: 10
+    nb_const: 10.0
+    nb_form: l2
+    nb_threshold: 4.0
+    nb_normalize_by: active
+    segment_const: 10.0
+    segment_form: l2
+    segment_threshold: 2.0
+    segment_normalize_by: active
+    early_stopping_clash_score: null
+    early_stopping_clash_thresh: 3.5
+    normalize_energy: true

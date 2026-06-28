@@ -1,0 +1,91 @@
+# Original SpectralDiT transformer trunk with the v12-style additive low-k
+# correction head. This keeps the historical transformer architecture intact
+# while specializing the clean-spectrum x_0 prediction for DC and k=1..16.
+
+core:
+  run_name: "transformer_displacement_ca"
+  window_size: 256
+  top_k_freqs: 256
+  epochs: 300
+  checkpoint_dir: "/projects/u6ji/hew/pancake_checkpoints/transformer_displacement_ca"
+  checkpoint_path:
+  use_DCT: true
+  representation: "displacement"
+  freq_normalization: "auto"
+  dc_residualization: "auto"
+  aniso_source: "auto"
+  use_atlas: false
+  use_zarr: true
+  coords_type: "ca"
+  model_type: "spectral_dit_low_k"
+  resume_from_latest: false
+
+data:
+  mdcath_path: "/projects/u6ji/hew/mdCATH/data/data"
+  atlas_path: "/projects/u6ji/hew/ATLAS"
+  trim_cache: false
+  offline_mode: true
+  batch_size: 100
+  max_domains: 5398
+  crop: true
+  crop_size: 576
+  freq_scales_path: "/projects/u6ji/hew/conditioned_freq_scales_with_per_res_dc.pt"
+  samples_per_traj: 1
+  randomize_train_windows: true
+  mdcath_zarr_path: /projects/u6ji/hew/mdCATH/mdcath_unified2.zarr
+  atlas_zarr_path: /projects/u6ji/hew/ATLAS/atlas_unified.zarr
+  rmsf_prior_path: null
+  split_ids_dir: /projects/u6ji/hew/pancake/splits/mdCATH
+
+model:
+  freq_hidden_size: 12
+  num_layers: 12
+  num_heads: 8
+  use_seq_conditioning: true
+  seq_embed_dim: 16
+  use_ss_conditioning: true
+  ss_embed_dim: 8
+  prediction_target: "x_0"
+  conditioning_dropout: true
+  guidance_scale: 1.0
+  num_ode_steps: 50
+  max_val_batches: 10
+  bridge_scaling: "none"
+  coord_scale: null
+  use_low_k_correction_head: true
+  low_k_correction_modes: "DC,1-4,5-16"
+
+diffusion:
+  num_steps: 1000
+  schedule: "cosine"
+  shift_value: 0.0
+  min_snr_gamma: null
+  aniso_gamma: 0.5
+
+training:
+  optimizer: "adamw"
+  max_lr: 3.0e-5
+  freq_weighting: "exponential_decay"
+  bending_lambda: 0.1
+  geometry_lambda: 0.0
+  geometry_tol: 0.05
+  clash_lambda: 0.0
+  clash_threshold: 3.5
+  clash_max_pairs: 4096
+  clash_pair_chunk: 512
+  geometry_warmup_start: 5
+  geometry_warmup_epochs: 10
+  rmsf_lambda: 0.0
+  rmsf_warmup_start: 20
+  rmsf_warmup_epochs: 20
+  low_freq_lambda: 0.0
+  low_freq_modes: 8
+  dc_lambda: 0.0
+  dc_start_epoch: 10
+  ddp_find_unused_parameters: false
+  ddp_static_graph: true
+
+deprecated:
+  smoothing: null
+  smoothing_sigma: 1.0
+  smooth_start_freq: 64

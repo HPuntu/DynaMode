@@ -1,0 +1,121 @@
+# SpecConv displacement model using conditioned unit-std spectral scales.
+#
+# The scale artifact should be built with per-feature standard deviations
+# (stat_name=std, alpha=1.0) and include the per-residue DC baseline table.
+# With noise_space=model_normalized, the targeted schedule interprets SNR in
+# the same normalized space the model sees after dividing by these scales.
+
+core:
+  run_name: spec_conv_displacement_ca_unit_var
+  checkpoint_dir: /projects/u6ji/hew/pancake_checkpoints/spec_conv_displacement_ca_unit_var
+  checkpoint_path: null
+  resume_from_latest: false
+  model_type: spectral_conv_block_mix_amplitude
+  epochs: 300
+
+data:
+  mdcath_path: /projects/u6ji/hew/mdCATH/data/data
+  atlas_path: /projects/u6ji/hew/ATLAS
+  use_atlas: false
+  use_zarr: true
+  mdcath_zarr_path: /projects/u6ji/hew/mdCATH/mdcath_unified2.zarr
+  atlas_zarr_path: /projects/u6ji/hew/ATLAS/atlas_unified.zarr
+  split_ids_dir: /projects/u6ji/hew/pancake/splits/mdCATH
+  freq_scales_path: /projects/u6ji/hew/conditioned_freq_scales_displacement_unit_std_alpha1p00_with_per_res_dc.pt
+  rmsf_prior_path: null
+  offline_mode: true
+  trim_cache: false
+  batch_size: 200
+  max_domains: 5398
+  samples_per_traj: 1
+  randomize_train_windows: true
+  crop: true
+  crop_size: 576
+
+representation:
+  representation: displacement
+  coords_type: ca
+  window_size: 256
+  top_k_freqs: 256
+  use_DCT: true
+  freq_normalization: auto
+  dc_residualization: auto
+  aniso_source: auto
+
+model:
+  freq_hidden_size: 12
+  spectral_modes: 256
+  num_layers: 12
+  num_heads: 8
+  prediction_target: x_0
+  conditioning_dropout: true
+  use_seq_conditioning: true
+  seq_embed_dim: 16
+  use_ss_conditioning: true
+  ss_embed_dim: 8
+  use_hilbert_spatial: false
+  use_hilbert_spatial_dct: true
+  hilbert_mode: input_only
+  use_rmsf_prior_gain: false
+  use_low_k_correction_head: true
+  low_k_correction_modes: DC,1-8,9-16
+  amp_head_context_modes: 12
+  amp_head_target_modes: 8
+  amp_head_d_model: 128
+  amp_head_depth: 3
+  amp_head_num_heads: 4
+  amp_head_mlp_ratio: 4.0
+  amp_head_attn_dropout: 0.0
+  amp_head_use_rmsf_prior: false
+  use_shake: true
+  shake_n_iter: 2
+  shake_target: 3.84
+
+diffusion:
+  num_steps: 1000
+  schedule: cosine
+  noise_schedule: cosine_low_first_targeted
+  noise_space: model_normalized
+  noise_band_edges: DC,1-8,9-32,33-128,129+
+  noise_target_crossings: [560, 500, 400, 310, 230]
+  noise_anchor_band: k9-32
+  noise_power_normalization: raw_mean_square
+  shift_value: auto
+  min_snr_gamma: null
+  aniso_gamma: 0.5
+
+sampling:
+  guidance_scale: 1.0
+  num_ode_steps: 50
+  max_val_batches: 10
+
+training:
+  optimizer: adamw
+  max_lr: 3.0e-5
+  freq_weighting: exponential_decay
+  bending_lambda: 0.0
+  geo_loss: spec_geo
+  geometry_lambda: 0.05
+  geometry_tol: 0.05
+  clash_lambda: 1.0
+  clash_threshold: 2.5
+  clash_max_pairs: 1024
+  clash_pair_chunk: 512
+  topology_margin_path: null
+  spectral_geo_segment_threshold: 1.0
+  spectral_geo_max_segment_pairs: 512
+  risk_band_max_pairs: 512
+  risk_band_max_segment_pairs: 0
+  geometry_warmup_start: 0
+  geometry_warmup_epochs: 10
+  rmsf_lambda: 0.0
+  rmsf_warmup_start: 10
+  rmsf_warmup_epochs: 50
+  low_freq_lambda: 0.0
+  low_freq_modes: 8
+  dc_lambda: 0.0
+  dc_start_epoch: 10
+  max_bad_update_streak: 25
+  max_bad_update_total: 250
+  ddp_find_unused_parameters: false
+  ddp_static_graph: true

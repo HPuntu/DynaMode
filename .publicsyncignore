@@ -1,0 +1,25 @@
+.git/
+.github/
+.env
+.agents/
+.codex/
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Local/generated project state
+data/
+checkpoints/
+splits/
+logs/
+wandb/
+TODO.md
+
+# Large or private artifacts
+*.ckpt
+*.h5
+*.npy
+*.npz
+*.pt
+*.pth
+*.zarr/
