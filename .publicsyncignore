@@ -7,6 +7,8 @@ __pycache__/
 *.py[cod]
 .DS_Store
 
+*.sbatch
+
 # Local/generated project state
 data/
 checkpoints/
