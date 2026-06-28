@@ -24,7 +24,10 @@ conda activate dynamode
 
 ### OPTIONAL Prepare Zarr Dataset for Fast Training
 
-MD-CATH:
+Using zarr files can immensely increase both stability of training and speed by precomputing 
+features into numerical arrays and not relying on maintaining open file streaming of .h5's or
+temporary pdb file streams which can cause training.
+
 ```bash
 python -m scripts.extract_mdcath_features_to_zarr.py --[args]
 python -m scripts.extract_atlas_features_to_zarr.py --[args]
