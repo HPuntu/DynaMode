@@ -3974,7 +3974,6 @@ def TRAIN_DISTRIBUTED(
     dc_residualization="auto",
     aniso_source="auto",
     aniso_scales_path=None,
-    aniso_legacy_direction=False,
     noise_schedule=None,
     noise_space="raw_gamma",
     noise_band_edges=None,
@@ -5183,7 +5182,6 @@ def TRAIN_DISTRIBUTED(
         "schedule": schedule,
         "shift_value": shift_value,
         "aniso_gamma": aniso_gamma,
-        "aniso_legacy_direction": aniso_legacy_direction,
         "noise_schedule": noise_schedule,
         "noise_space": noise_space,
         "noise_band_edges": noise_band_edges,
@@ -5721,8 +5719,6 @@ if __name__ == "__main__":
     parser.add_argument("--aniso_gamma", type=float, default=None,
                         help="Anisotropic noise exponent (0.0=off, 0.3=recommended). "
                              "Default None=isotropic.")
-    parser.add_argument("--aniso_legacy_direction", action=argparse.BooleanOptionalAction, default=None,
-                        help="Use the legacy high-k-heavy anisotropic direction.")
     parser.add_argument("--noise_schedule", type=str, default=None,
                         help="High-level noise preset, e.g. freq_scale_gamma, cosine_low_first_targeted.")
     parser.add_argument("--noise_space", type=str, default=None,

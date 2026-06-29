@@ -1,4 +1,4 @@
-# CA-only analogue of aSAM2's mdCATH minimisation protocol.
+# CA-only analogue of aSAM2's )https://github.com/giacomo-janson/sam2) mdCATH minimisation protocol.
 #
 # aSAM2's all-atom minimizer works in nm and uses atom14 force-field terms.
 # These values are converted/adapted to Angstrom CA traces. Length-squared

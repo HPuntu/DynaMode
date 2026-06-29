@@ -21,14 +21,12 @@ def default_band_edges(top_k_freqs: int, scheme: str = "block_mix") -> tuple[int
     scheme = str(scheme).strip().lower().replace("-", "_")
     if scheme in {"low_k", "lowk", "dct_low", "dct"}:
         candidates = (0, 1, 5, 17, 65, K)
-    elif scheme in {"legacy", "block_mix_legacy", "legacy_block_mix", "spec_conv_legacy"}:
-        candidates = (0, 8, 32, 128, K)
     elif scheme in {"block_mix", "physical", "spec_conv"}:
         candidates = (0, 1, 9, 33, 129, K)
     else:
         raise ValueError(
             f"Unknown default band scheme {scheme!r}. Use 'block_mix', "
-            "'block_mix_legacy', or 'low_k'."
+            "'physical', 'spec_conv', or 'low_k'."
         )
 
     edges: list[int] = []
@@ -101,7 +99,7 @@ def parse_band_edges(
     Supported forms:
     - None -> :func:`default_band_edges`
     - iterable of integer edges, e.g. (0, 1, 9, 33, 129, 256)
-    - named default: "block_mix", "block_mix_legacy", or "low_k"
+    - named default: "block_mix", "physical", "spec_conv", or "low_k"
     - edge string: "0,1,9,33,129,256"
     - inclusive ranges: "DC,1-4,5-16,17+"
     """
@@ -117,10 +115,6 @@ def parse_band_edges(
             "block_mix",
             "physical",
             "spec_conv",
-            "legacy",
-            "block_mix_legacy",
-            "legacy_block_mix",
-            "spec_conv_legacy",
             "low_k",
             "lowk",
             "dct_low",

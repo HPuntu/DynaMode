@@ -1,4 +1,4 @@
-"""CA-only post-inference minimisation utilities."""
+'''CA-only post-inference minimisation utilities.'''
 
 from dynamode.minimiser.ca import (
     CAMinimizer,

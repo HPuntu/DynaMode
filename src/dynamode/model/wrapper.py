@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 
 from dynamode.model.adapters import make_spectral_batch_adapter
-from dynamode.model.spec_conv.amplitude_mix import SpectralConvBlockMixAmplitude
+from dynamode.model.spec_conv.block_mix import SpectralConvBlockMixAmplitude
 from dynamode.model.transformer.transformer import SpectralDiT
 
 
@@ -74,7 +74,6 @@ class SpectralConvBlockMixAmplitudeConfig(BaseDiffusionConfig):
     ss_embed_dim: int = 8
     cond_dim: int = 512
     band_edges: tuple[int, ...] | str | None = None
-    warm_start_from_dense: bool = True
     amp_head_context_modes: int = 4
     amp_head_target_modes: int = 1
     amp_head_d_model: int = 128
@@ -86,9 +85,6 @@ class SpectralConvBlockMixAmplitudeConfig(BaseDiffusionConfig):
     use_shake: bool = False
     shake_n_iter: int = 20
     shake_target: float = 3.8
-    prediction_distribution: str = "deterministic"
-    distribution_logvar_min: float = -6.0
-    distribution_logvar_max: float = 2.0
 
 
 @dataclass(frozen=True)

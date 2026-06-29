@@ -413,7 +413,7 @@ def resolve_noise_schedule(
     noise_space = _canonical_noise_space(config.get("noise_space", "raw_gamma"))
     power_normalization = str(config.get("noise_power_normalization", "raw_mean_square"))
 
-    if preset in {"", "none", "legacy_config"}:
+    if preset in {"", "none", "config"}:
         shift_value = _optional_float(shift_config, default=0.0)
         aniso_gamma = config.get("aniso_gamma")
         aniso_weights = None
@@ -423,10 +423,9 @@ def resolve_noise_schedule(
                 gamma=float(aniso_gamma),
                 top_k=top_k_freqs,
                 channels=channels,
-                legacy_direction=bool(config.get("aniso_legacy_direction", False)),
             )
         diag = _diagnostics(
-            name="legacy_config",
+            name="config",
             raw_weights=aniso_weights,
             freq_scales=freq_scales,
             channels=channels,
@@ -446,8 +445,6 @@ def resolve_noise_schedule(
         "frequency_scale_gamma": "freq_scale_gamma",
         "anisotropic_gamma": "freq_scale_gamma",
         "gamma": "freq_scale_gamma",
-        "legacy": "legacy_high_k",
-        "legacy_high_k": "legacy_high_k",
         "cosine_isotropic": "cosine_isotropic",
         "isotropic": "cosine_isotropic",
         "flat_model": "cosine_flat_model",
@@ -486,7 +483,7 @@ def resolve_noise_schedule(
             ),
         )
 
-    if freq_scales is None and preset in {"freq_scale_gamma", "legacy_high_k"}:
+    if freq_scales is None and preset == "freq_scale_gamma":
         raise ValueError(
             f"noise_schedule={preset!r} derives gamma weights from frequency scales; "
             "provide freq_scales_path/aniso_source or use another preset."
@@ -513,17 +510,6 @@ def resolve_noise_schedule(
             gamma=gamma,
             top_k=top_k_freqs,
             channels=channels,
-            legacy_direction=False,
-        ).to(device)
-        shift_value = _optional_float(shift_config, default=0.0)
-    elif preset == "legacy_high_k":
-        gamma = float(config.get("aniso_gamma", 0.5) if config.get("aniso_gamma") is not None else 0.5)
-        raw_weights = make_aniso_weights(
-            freq_scales,
-            gamma=gamma,
-            top_k=top_k_freqs,
-            channels=channels,
-            legacy_direction=True,
         ).to(device)
         shift_value = _optional_float(shift_config, default=0.0)
     elif preset == "cosine_flat_model":

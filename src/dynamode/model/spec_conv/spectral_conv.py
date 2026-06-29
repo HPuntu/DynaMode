@@ -1,8 +1,5 @@
 '''
-CNO2 — Cosine Neural Operator with spectral convolution and cross-frequency mixer.
-
-Difference from the baseline transformer
------------------------------------------
+FNO-style spectral convolution module. Building on the SpectralDiT base,
 The FFN in each block is replaced by an FNO-style spectral operation that
 explicitly respects the K (frequency) structure of the token:
 
@@ -47,19 +44,18 @@ from dynamode.model.modules import (
 from dynamode.model.spec_conv.hilbert import HilbertSpatialEnvelope, HilbertSpatialEnvelopeDCT
 
 
-
-# Hilbert spatial envelope
-
+# config handling
 def _parse_low_k_correction_spec(spec, top_k_freqs: int) -> tuple[list[tuple[int, int]], list[int]]:
-    """Parse correction-head specs into non-overlapping inclusive mode ranges.
+    '''
+    Parse correction-head specs into non-overlapping inclusive mode ranges.
 
     Supported forms:
-    - legacy int ``n`` -> range ``0..n-1``
-    - bare digit string ``"4"`` -> legacy count ``0..3``
-    - ``"DC"`` -> ``0..0``
-    - ``"1-4"`` -> inclusive range ``1..4``
-    - comma-separated combinations like ``"DC,1-4"``
-    """
+    - legacy int n -> range 0..n-1
+    - bare digit string "4" -> legacy count 0..3
+    - "DC" -> 0..0
+    - "1-4" -> inclusive range 1..4
+    - comma-separated combinations like "DC,1-4"
+    '''
     if spec is None:
         return [], []
 
@@ -124,15 +120,13 @@ def _parse_low_k_correction_spec(spec, top_k_freqs: int) -> tuple[list[tuple[int
     return ranges, target_modes
 
 
-
-# ---------------------------------------------------------------------------
 # Spectral convolution
-# ---------------------------------------------------------------------------
-
+# --------------------
 class SpectralConv1d(nn.Module):
-    '''Learned mixing of the first `modes` DCT frequency modes.
+    '''
+    Learned mixing of the first modes DCT frequency modes.
 
-    Weight shape: (C_in, C_out, modes). Modes beyond `modes` are zeroed
+    Weight shape: (C_in, C_out, modes). Modes beyond modes are zeroed
     (hard low-pass), so the spectral path cannot represent high-frequency
     content that wasn't already in the input.
     '''
@@ -154,25 +148,22 @@ class SpectralConv1d(nn.Module):
         return out
 
 
-# ---------------------------------------------------------------------------
 # SpectralConv Block
-# ---------------------------------------------------------------------------
-
 class SpectralConvBlock(nn.Module):
-    '''Residue attention + spectral conv + cross-frequency mixer.
+    '''
+    Residue attention + spectral conv + cross-frequency mixer.
 
     Phase 1 — Residue self-attention: inter-residue correlations.
     Phase 2 — Spectral FNO: SpectralConv + pointwise + freq_mixer + GELU.
 
     Both phases use AdaLN-Zero conditioning.
 
-    Args:
-        d_model: Total token dimension D = K * freq_hidden_size.
-        freq_hidden_size: Per-frequency latent width H.
-        n_freqs: Number of DCT modes K.
-        num_heads: Attention heads; must divide D.
-        spectral_modes: Number of modes processed by SpectralConv.
-        attn_dropout: Attention output dropout for regularisation.
+    d_model = Total token dimension D = K * freq_hidden_size.
+    freq_hidden_size = Per-frequency latent width H.
+    n_freqs = Number of DCT modes K.
+    num_heads = Attention heads; must divide D.
+    spectral_modes = Number of modes processed by SpectralConv.
+    attn_dropout = Attention output dropout for regularisation.
     '''
 
     def __init__(
@@ -281,8 +272,9 @@ class SpectralConvBlock(nn.Module):
         return x
 
 
-VALID_HILBERT_MODES = {"every_block", "every_3_blocks", "input_only", "off"}
+# Hilbert helpers
 
+VALID_HILBERT_MODES = {"every_block", "every_3_blocks", "input_only", "off"}
 
 def _hilbert_enabled_for_block(hilbert_mode: str, block_idx: int) -> bool:
     if hilbert_mode == "every_block":
@@ -299,36 +291,33 @@ def _hilbert_enabled_for_block(hilbert_mode: str, block_idx: int) -> bool:
     )
 
 
-# ---------------------------------------------------------------------------
 # Full model
-# ---------------------------------------------------------------------------
-
 class SpectralConvDiT(nn.Module):
-    '''SpectralConv: spectral diffusion transformer with FNO-style frequency convolutions.
+    '''
+    SpectralConv: spectral diffusion transformer with FNO-style frequency convolutions.
 
     Input: raw DCT coefficients of coordinate deviations (x - native), shape (B, L, K*C_in).
     Normalisation (÷ freq_scale) is applied internally; output is denormalised before return
     so the diffusion process and loss stay in raw coefficient scale.
 
-    Args:
-        top_k_freqs: Number of retained DCT modes K.
-        in_channels: Coordinate channels per mode.
-        cond_channels: Native conditioning channels.
-        freq_hidden_size: Per-frequency latent width H; D = K * H.
-        depth: Number of SpectralConvBlocks.
-        num_heads: Attention heads; must divide D.
-        spectral_modes: Number of modes used in SpectralConv (K_modes ≤ K).
-                        Focus on low-frequency modes — recommend K/4.
-        attn_dropout: Attention output dropout for regularisation. Recommend 0.1
-            for small datasets (<500 proteins); 0.0 at full scale.
-        freq_scale: Per-feature 95th-pct amplitudes (K*C_in,). Required for
-                    correct training — without it, DC contamination via
-                    freq_mixer will catastrophically amplify low modes.
-        cfg_dropout: Enable classifier-free guidance conditioning dropout.
-            Randomly nulls native_coords/temp/win_pos during training so the
-            model learns both conditional and unconditional distributions.
-            Unrelated to attn_dropout.
-        prediction_target: "v", "x_0", or "noise".
+    top_k_freqs = Number of retained DCT modes K.
+    in_channels = Coordinate channels per mode.
+    cond_channels = Native conditioning channels.
+    freq_hidden_size = Per-frequency latent width H; D = K * H.
+    depth = Number of SpectralConvBlocks.
+    num_heads = Attention heads; must divide D.
+    spectral_modes = Number of modes used in SpectralConv (K_modes ≤ K).
+                     Focus on low-frequency modes — recommend K/4.
+    attn_dropout = Attention output dropout for regularisation. Recommend 0.1
+                   for small datasets (<500 proteins); 0.0 at full scale.
+    freq_scale = Per-feature 95th-pct amplitudes (K*C_in,). Required for
+                 correct training — without it, DC contamination via
+                 freq_mixer will catastrophically amplify low modes.
+    cfg_dropout = Enable classifier-free guidance conditioning dropout.
+                  Randomly nulls native_coords/temp/win_pos during training so the
+                  model learns both conditional and unconditional distributions.
+                  Unrelated to attn_dropout.
+    prediction_target = "v", "x_0", or "noise".
     '''
 
     is_time_domain: bool = False
@@ -588,7 +577,7 @@ class SpectralConvDiT(nn.Module):
         tau_emb = self.temp_embedder(temp)
         s_emb   = self.pos_embedder(win_pos)
         # CFG dropout: null only temperature (and native_coords, handled
-        # upstream in ``forward``). Window position, size, sequence, DSSP,
+        # upstream in forward). Window position, size, sequence, DSSP,
         # and scale-conditioning signals are metadata / identity signals
         # without a useful "unconditional" branch, so we keep them always on.
         if self.cfg_dropout and cond_drop_mask is not None:
@@ -708,21 +697,20 @@ class SpectralConvDiT(nn.Module):
         return ss_local, ss_global
 
     def _rmsf_gain(self, rmsf_prior: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
-        '''Compute the per-residue output gain from the NMA RMSF prior.
+        '''
+        Compute the per-residue output gain from the NMA RMSF prior.
 
         Returns a tensor of shape (B, L, 1, 1) to broadcast over (K, C_in) on
-        the post-projection output. At init ``rmsf_gate = 0`` the gain is 1.0
+        the post-projection output. At init rmsf_gate = 0 the gain is 1.0
         everywhere (identity). As the gate grows the gain approaches the
         protein-specific relative flexibility envelope
-        ``rmsf_prior / mean_rmsf_prior`` per residue.
+        rmsf_prior / mean_rmsf_prior per residue.
 
-        Args:
-            rmsf_prior: (B, L) per-residue unitless ANM RMSF.
-            mask:       (B, L) optional validity mask used to compute the
-                        per-protein mean only over valid residues.
+        rmsf_prior = (B, L) per-residue unitless ANM RMSF.
+        mask = (B, L) optional validity mask used to compute the
+               per-protein mean only over valid residues.
 
-        Returns:
-            (B, L, 1, 1) gain tensor.
+        Returns (B, L, 1, 1) gain tensor.
         '''
         prior = torch.nan_to_num(
             rmsf_prior.float(),
@@ -748,19 +736,18 @@ class SpectralConvDiT(nn.Module):
         rmsf_prior: torch.Tensor | None,
         mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        '''Apply the NMA RMSF gain to an x_0-like tensor.
+        '''
+        Apply the NMA RMSF gain to an x_0-like tensor.
 
         The prior is physically a clean-sample amplitude prior, so it should
         act on predicted x_0 rather than directly on v/noise targets.
 
-        Args:
-            x: Either flattened spectral features ``(B, L, D)`` or unflattened
-                ``(B, L, K, C)`` clean-sample-like tensor.
-            rmsf_prior: (B, L) per-residue unitless ANM RMSF.
-            mask: Optional (B, L) validity mask used for the per-protein mean.
+        x = Either flattened spectral features (B, L, D) or unflattened
+            (B, L, K, C) clean-sample-like tensor.
+        rmsf_prior = (B, L) per-residue unitless ANM RMSF.
+        mask = Optional (B, L) validity mask used for the per-protein mean.
 
-        Returns:
-            Tensor with the same shape as ``x``.
+        Returns tensor with the same shape as x.
         '''
         if not self.use_rmsf_prior_gain or rmsf_prior is None:
             return x

@@ -1,27 +1,25 @@
-"""CA-only geometry minimiser inspired by aSAM2's postprocessor.
-
-aSAM2 minimises all-atom atom14 structures with force-field bonds, angles,
-dihedrals and non-bonded terms.  Pancake often works with CA trajectories, so
-this module keeps the same optimiser shape but replaces the energy with CA-only
-terms:
+'''
+CA-only geometry minimiser inspired by aSAM2's (https://github.com/giacomo-janson/sam2) 
+postprocessor. Adjusted for CA-only.
 
 * adjacent CA-CA bond restraints;
 * CA bend-angle preservation;
 * CA pseudo-dihedral preservation;
-* non-bonded CA-CA clash repulsion for sequence separation >= ``min_sep``.
+* non-bonded CA-CA clash repulsion for sequence separation >= min_sep.
 * weak segment-intersection repulsion.
 
 Coordinates are in Angstroms.
-"""
+
+Includes numerous safeguards to handle exploding relexation steps from topology
+crossovers which trigger early cancellation.
+'''
 
 from __future__ import annotations
-
 import copy
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-
 import torch
 
 
@@ -111,7 +109,7 @@ DEFAULT_PARAMS = {
 
 
 class CAMinimizerEarlyStopping(Exception):
-    """Raised internally when the clash score is already low enough."""
+    '''Raised internally when the clash score is already low enough.'''
 
     def __init__(self, score: torch.Tensor, thresh: float):
         super().__init__(f"CA minimizer early stopping: {score.item():.4g} <= {thresh}")
@@ -186,7 +184,7 @@ def _caca_bond_range_per_frame(
     *,
     eps: float = 1e-12,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return min/max adjacent CA-CA bond lengths for each flattened frame."""
+    '''Return min/max adjacent CA-CA bond lengths for each flattened frame.'''
     bond_ids = topology["bonds"]["ids"].to(device=positions.device)
     n_frames = positions.shape[0]
     if bond_ids.numel() == 0:
@@ -215,7 +213,7 @@ def get_topology(
     nb_centers_threshold: float = 10.0,
     device: torch.device | str | None = None,
 ) -> dict[str, Any]:
-    """Build a CA-only topology for a fixed residue count."""
+    '''Build a CA-only topology for a fixed residue count.'''
     device = torch.device(device) if device is not None else torch.device("cpu")
     n_residues = int(n_residues)
     if n_residues <= 0:
@@ -323,7 +321,7 @@ def calc_segment_segment_distances(
     q2: torch.Tensor,
     eps: float = 1e-8,
 ) -> torch.Tensor:
-    """Closest distances between batched 3D line segments."""
+    '''Closest distances between batched 3D line segments.'''
     u = q1 - p1
     v = q2 - p2
     w = p1 - p2
@@ -426,7 +424,7 @@ def calc_energy(
     eps: float = 1e-12,
     verbose: bool = False,
 ) -> torch.Tensor:
-    """Return summed CA minimisation energy over flattened frames."""
+    '''Return summed CA minimisation energy over flattened frames.'''
     del verbose
     mask = topology["mask"].to(device=positions.device)
     total = positions.new_zeros(positions.shape[0])
@@ -646,7 +644,7 @@ def minimize(
     return_early_stopping: bool = False,
     verbose: int | bool = 1,
 ) -> torch.Tensor | tuple[torch.Tensor, bool]:
-    """Run one optimisation stage on flattened CA positions."""
+    '''Run one optimisation stage on flattened CA positions.'''
     if isinstance(verbose, bool):
         verbose = int(verbose)
     energy_params = dict(energy_params or {})
@@ -836,7 +834,7 @@ def minimize(
 
 
 class CAMinimizer:
-    """Small runner class matching the aSAM2 minimizer shape for CA traces."""
+    '''Small runner class matching the aSAM2 minimizer shape for CA traces.'''
 
     def __init__(
         self,
@@ -866,7 +864,7 @@ class CAMinimizer:
         device: torch.device | str | None = None,
         verbose: int | bool = 1,
     ) -> torch.Tensor:
-        """Minimise a CA trajectory tensor with shape ``(..., L, 3)``."""
+        '''Minimise a CA trajectory tensor with shape (..., L, 3).'''
         if device is None:
             device = ca_coords.device
         device = torch.device(device)
@@ -915,7 +913,7 @@ def minimise_ca(
     device: torch.device | str | None = None,
     verbose: int | bool = 1,
 ) -> torch.Tensor:
-    """Convenience wrapper around :class:`CAMinimizer`."""
+    '''Convenience wrapper around :class:`CAMinimizer`.'''
     runner = CAMinimizer(protocol=protocol, params_fp=params_fp, params=params)
     return runner.run(ca_coords, mask=mask, batch_size=batch_size, device=device, verbose=verbose)
 

@@ -1,13 +1,16 @@
 
-"""Auxiliary transformer blocks used by SpecConv heads."""
+'''
+Auxiliary transformer blocks used by SpecConv heads.
+'''
+
 
 from __future__ import annotations
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from dynamode.model.modules import SwiGLU, apply_rotary_pos_emb
+
 
 
 class CrossAttention(nn.Module):
@@ -80,7 +83,7 @@ class FrequencyAttention(nn.Module):
 
     def forward(self, x, t_emb):
         '''
-        Input x: (B * K, L, D) - The flattened batch from the spatial layers
+        x = (B * K, L, D) - The flattened batch from the spatial layers
         '''
         total_batch, L, D = x.shape
         K = self.num_freqs
@@ -121,83 +124,16 @@ class FrequencyAttention(nn.Module):
         x = x + gate.unsqueeze(1) * x_attn_out
         
         return x
-    
-
-# FROM PROTOTYPE SLOW + FAST BRANCH SETUP
-# class SlowToFastCrossAttention(nn.Module):
-#     '''
-#     One-way cross-attention from slow-branch tokens to fast-branch tokens.
-
-#     Query from fast-branch residue tokens, Key/Value from a projection of the 
-#     slow-branch output. Residue-indexed on both sides (L_fast == L_slow == L), 
-#     so the attention is effectively learned per-residue mixing of the per-residue 
-#     slow context into the fast stream. The output is multiplied by a per-block learnable scalar gate.
-
-#     d_fast = Fast-branch token width (queries).
-#     slow_context_dim = Dimension of the slow-context tokens (keys/values).
-#                        Typically K_slow * in_channels or a pre-projected width.
-#     num_heads = Multi-head attention heads; must divide ``d_fast``.
-#     dropout = Output dropout.
-#     '''
-
-#     def __init__(
-#         self,
-#         d_fast: int,
-#         slow_context_dim: int,
-#         num_heads: int,
-#         dropout: float = 0.0,
-#     ) -> None:
-#         super().__init__()
-#         if d_fast % num_heads != 0:
-#             raise ValueError(
-#                 f'd_fast={d_fast} must be divisible by num_heads={num_heads}'
-#             )
-#         self.num_heads = int(num_heads)
-#         self.head_dim = d_fast // self.num_heads
-
-#         self.norm_q = nn.LayerNorm(d_fast, elementwise_affine=False, eps=1e-6)
-#         self.kv_proj = nn.Linear(slow_context_dim, 2 * d_fast, bias=False)
-#         self.q_proj = nn.Linear(d_fast, d_fast, bias=False)
-#         self.out_proj = nn.Linear(d_fast, d_fast, bias=False)
-#         self.drop = nn.Dropout(dropout)
-
-#         # Zero-init gate — bridge is effectively absent at step 0, letting
-#         # the fast branch start from a warm-start checkpoint unchanged.
-#         self.gate = nn.Parameter(torch.zeros(1))
-
-#     def forward(
-#         self,
-#         fast_tokens: torch.Tensor,
-#         slow_context: torch.Tensor,
-#         mask: torch.Tensor | None = None,
-#     ) -> torch.Tensor:
-#         B, L, D = fast_tokens.shape
-
-#         q_in = self.norm_q(fast_tokens)
-#         q = self.q_proj(q_in).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
-#         kv = self.kv_proj(slow_context).view(B, L, 2, self.num_heads, self.head_dim)
-#         kv = kv.permute(2, 0, 3, 1, 4)
-#         k, v = kv[0], kv[1]
-
-#         attn_mask = None
-#         if mask is not None:
-#             mb = mask.bool()
-#             attn_mask = (mb.unsqueeze(1) & mb.unsqueeze(2)).unsqueeze(1)
-
-#         out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0)
-#         out = out.transpose(1, 2).reshape(B, L, D)
-#         out = self.drop(self.out_proj(out))
-#         return self.gate * out
-
 
 class AuxSpectralTransformerBlock(nn.Module):
-    """AdaLN transformer block for auxiliary SpecConv heads.
+    '''
+    AdaLN transformer block for auxiliary SpecConv heads.
 
-    This is intentionally separate from ``SpectralConvBlock`` in
-    ``spectral_conv.py``. It operates on ordinary residue tokens and does not
+    This is intentionally separate from SpectralConvBlock in
+    spectral_conv.py. It operates on ordinary residue tokens and does not
     perform the FNO-style convolution over frequency modes used by the main
     SpecConv trunk.
-    """
+    '''
 
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, dropout=0.0, use_cross_attn=False, use_freq_coords=False, num_freq_coords=64):
         super().__init__()

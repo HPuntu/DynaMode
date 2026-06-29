@@ -5,50 +5,34 @@ denoising and associated hyperparameters.
 
 
 import torch
-import torch.nn as nn
-import numpy as np
 import math
 
 
 
-def make_aniso_weights(
-    freq_scales, gamma=0.5, top_k=None, channels=None, legacy_direction=False
-):
-    '''Derive per-bin anisotropic noise multipliers from freq_scales.
+def make_aniso_weights(freq_scales, gamma=0.5, top_k=None, channels=None):
+    '''
+    Derive per-bin anisotropic noise multipliers from freq_scales.
 
-    Current direction (default). w_k = (scale_k / min_scale) gamma.
+    w_k = (scale_k / min_scale) ** gamma.
     Low-k bins (with the largest scale_k) receive the largest multiplier:
     low frequencies are perturbed more heavily than high during forward
-    diffusion. This is the intended, physically-motivated direction.
-
-    Legacy direction (legacy_direction=True). w_k = (min_scale / scale_k) gamma.
-    High-k bins receive the largest multiplier. This flag exists solely to
-    reproduce the noise schedule that was in place before the direction was
-    corrected: checkpoints trained under the legacy schedule must be evaluated
-    with the same schedule, because the denoiser learned to invert one
-    specific noise distribution and swapping direction at inference time
-    initialises the ODE sampler from a distribution the model has never seen.
+    diffusion.
 
     Normalised so mean(w_k^2) = 1, keeping total noise power identical to
-    the isotropic case in both directions.
+    the isotropic case.
 
     Args:
         freq_scales: 1-D tensor of shape (D,).
         gamma: Exponent controlling anisotropy strength (0 = isotropic).
         top_k: If not None, use only first top_k * channels elements.
         channels: Channels per frequency bin.
-        legacy_direction: If True, invert the direction for backward
-            compatibility with pre-flip checkpoints.
 
     Returns:
         Tensor of shape (D,) with per-bin noise multipliers.
     '''
     D = (top_k * channels) if (top_k is not None and channels is not None) else len(freq_scales)
     s = freq_scales[:D].float().clamp(min=1e-8)
-    if legacy_direction:
-        w = (s.min() / s) ** gamma
-    else:
-        w = (s / s.min()) ** gamma
+    w = (s / s.min()) ** gamma
     # Normalise: keep total noise power equal to isotropic case
     w = w / w.pow(2).mean().sqrt()
     return w
@@ -151,8 +135,8 @@ class SpectralDiffusion:
         '''Sample the prior noise x_T ~ N(0, w^2) for DDIM initialisation.
 
         With anisotropic weights each bin k is scaled by w_k.  The schedule
-        resolver decides whether those weights are high-k-heavy, low-k-heavy,
-        or targeted to model-space SNR crossings.
+        resolver decides whether those weights are gamma-derived or targeted
+        to model-space SNR crossings.
         For isotropic diffusion this is identical to torch.randn(shape).
         '''
         dev = device or self.device

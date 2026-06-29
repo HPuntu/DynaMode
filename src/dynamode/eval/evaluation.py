@@ -3424,7 +3424,6 @@ def parse_args() -> dict:
     parser.add_argument("--shift_value", type=str, default=None)
     parser.add_argument("--min_snr_gamma", type=float, default=None)
     parser.add_argument("--aniso_gamma", type=float, default=None)
-    parser.add_argument("--aniso_legacy_direction", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--noise_schedule", type=str, default=None)
     parser.add_argument("--noise_space", type=str, default=None, choices=["raw_gamma", "model_normalized"])
     parser.add_argument("--noise_band_edges", type=str, default=None)

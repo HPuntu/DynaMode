@@ -5,7 +5,8 @@ import torch.nn.functional as F
 
 
 class HilbertSpatialEnvelope(nn.Module):
-    '''Per-mode spatial amplitude envelope via Hilbert transform along L.
+    '''
+    Per-mode spatial amplitude envelope via Hilbert transform along L.
 
     For each DCT mode k and hidden channel h, computes the analytic signal
     along the residue axis L and returns the amplitude envelope |z(l)|.
@@ -19,9 +20,8 @@ class HilbertSpatialEnvelope(nn.Module):
         xs ← xs + gate * envelope(xs)
     where gate is a learned scalar initialised to 0.
 
-    Args:
-        freq_hidden_size: Per-frequency hidden width H.
-        n_freqs: Number of DCT modes K.
+    freq_hidden_size = Per-frequency hidden width H.
+    n_freqs = Number of DCT modes K.
     '''
 
     def __init__(self, freq_hidden_size: int, n_freqs: int):
@@ -31,7 +31,8 @@ class HilbertSpatialEnvelope(nn.Module):
 
     @staticmethod
     def _hilbert_envelope(x: torch.Tensor) -> torch.Tensor:
-        '''Amplitude envelope of real signal x along its last dimension.
+        '''
+        Amplitude envelope of real signal x along its last dimension.
 
         Uses the standard analytic-signal construction:
             1. fft along last dim
@@ -39,11 +40,7 @@ class HilbertSpatialEnvelope(nn.Module):
             3. ifft → complex analytic signal
             4. amplitude = |analytic|
 
-        Args:
-            x: (..., L) real tensor.
-
-        Returns:
-            Amplitude envelope (..., L), same shape and dtype as x.
+        Returns amplitude envelope (..., L), same shape and dtype as x.
         '''
         with torch.autocast(device_type=x.device.type, enabled=False):
             x_fp32 = x.to(dtype=torch.float32)
@@ -80,7 +77,8 @@ class HilbertSpatialEnvelope(nn.Module):
 
 
 class HilbertSpatialEnvelopeDCT(nn.Module):
-    '''Boundary-safe spatial Hilbert envelope via even-symmetric extension.
+    '''
+    Boundary-safe spatial Hilbert envelope via even-symmetric extension.
 
     Drop-in replacement for :class:`HilbertSpatialEnvelope` that avoids the
     periodic-boundary Gibbs artifact of the straight FFT-Hilbert. The input
@@ -91,15 +89,14 @@ class HilbertSpatialEnvelopeDCT(nn.Module):
     to constructing the analytic signal in the DCT/DST basis.
 
     Shares the same interface and the same single learnable parameter
-    ``gate`` (shape ``(freq_hidden_size,)``) as :class:`HilbertSpatialEnvelope`,
+    gate (shape (freq_hidden_size,)) as :class:`HilbertSpatialEnvelope`,
     so a checkpoint trained with the FFT-based envelope loads into this
-    module without modification — the stored ``gate`` values are carried over
+    module without modification — the stored gate values are carried over
     and the underlying transform is silently upgraded to the boundary-safe
     version.
 
-    Args:
-        freq_hidden_size: Per-frequency hidden width H.
-        n_freqs: Number of DCT modes K (unused; kept for interface parity).
+    freq_hidden_size = Per-frequency hidden width H.
+    n_freqs = Number of DCT modes K (unused; kept for interface parity).
     '''
 
     def __init__(self, freq_hidden_size: int, n_freqs: int):
@@ -111,22 +108,19 @@ class HilbertSpatialEnvelopeDCT(nn.Module):
 
     @staticmethod
     def _hilbert_envelope(x: torch.Tensor) -> torch.Tensor:
-        '''Amplitude envelope of real signal x along its last dimension on
+        '''
+        Amplitude envelope of real signal x along its last dimension on
         the even-symmetric extension.
 
         The signal is mirrored to length 2L:
-            ``x_ext = [x[0], ..., x[L-1], x[L-1], ..., x[0]]``
+            x_ext = [x[0], ..., x[L-1], x[L-1], ..., x[0]]
         which is continuous across the periodic wrap-around by construction
         (no jump at either seam). The standard FFT analytic-signal recipe
         then runs on a signal for which the periodicity assumption is valid,
         eliminating the central-amplification artifact of the raw FFT-Hilbert
         on a non-periodic residue chain.
 
-        Args:
-            x: (..., L) real tensor.
-
-        Returns:
-            Amplitude envelope (..., L), same shape and dtype as x.
+        Returns amplitude envelope (..., L), same shape and dtype as x.
         '''
         with torch.autocast(device_type=x.device.type, enabled=False):
             x_fp32 = x.to(dtype=torch.float32)
@@ -153,12 +147,10 @@ class HilbertSpatialEnvelopeDCT(nn.Module):
 
     def forward(self, xs: torch.Tensor, B: int, L: int) -> torch.Tensor:
         '''
-        Args:
-            xs: (B*L, H, K) — Phase 2 hidden state before spectral conv.
-            B, L: batch size and residue count.
+        xs = (B*L, H, K) — Phase 2 hidden state before spectral conv.
+        B, L = batch size and residue count.
 
-        Returns:
-            (B*L, H, K) envelope tensor scaled by learned gate.
+        Returns (B*L, H, K) envelope tensor scaled by learned gate.
         '''
         H, K = xs.shape[1], xs.shape[2]
         x_spatial = xs.view(B, L, H, K).permute(0, 2, 3, 1).contiguous()  # (B, H, K, L)
