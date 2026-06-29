@@ -1,7 +1,8 @@
-"""Unified test-set evaluation (mdCATH + ATLAS).
+'''
+Unified test-set evaluation (mdCATH + ATLAS).
 
-Implements the protocol described in ``evaluation.md``: for each test protein
-we generate ``n_repeats`` predicted trajectories (default 5), compute metrics
+Implements the protocol described in evaluation.md: for each test protein
+we generate n_repeats predicted trajectories (default 5), compute metrics
 against the full pooled MD ground-truth ensemble, and aggregate them.
 Most metrics are still averaged over per-repeat comparisons, but RMSF profile
 correlation is handled specially to match the MarS-FM analysis code: the
@@ -9,16 +10,14 @@ reported per-target RMSF Pearson/Spearman are computed from the full generated
 ensemble RMSF profile against the pooled MD reference RMSF profile.
 Also computes leave-one-out oracle baselines (5 folds for mdCATH, 3 for ATLAS).
 
-Based on the AlphaFlow / MDGen / MarS-FM protocols. Inference machinery reuses
-``src.test`` and ``src.test_tempo_mdgen``; the trajectory construction follows
-MarS-FM (two 256-frame windows concatenated then trimmed to 500 for mdCATH;
-single 256-frame window trimmed to 100 for ATLAS).
+Based on the AlphaFlow / MDGen / MarS-FM protocols. The trajectory construction
+follows MarS-FM (two 256-frame windows concatenated then trimmed to 500 for
+mdCATH; single 256-frame window trimmed to 100 for ATLAS).
 
 HPC-friendly: single-GPU or torchrun/srun-launched DDP (target-level sharding).
-"""
+'''
 
 from __future__ import annotations
-
 import argparse
 import contextlib
 import csv
@@ -31,37 +30,26 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from pprint import pprint
 import concurrent.futures
-
 import numpy as np
 import torch
 import torch.distributed as dist
 import yaml
 
-from src.features.features import (
-    Aligner,
+from dynamode.dataloader.features import (
     DSSP_STATES,
-    Featurizer,
-    compute_native_dssp_onehot,
     dssp_to_onehot,
 )
-from src.models.conditioned_freq_scale import load_freq_scale_artifact
-from src.models.diffusion import SpectralDiffusion
-from src.models.noise_schedule import format_noise_diagnostics, resolve_noise_schedule
-from src.models.model_wrapper import UnifiedWrapper
-from src.models.registry import (
-    DualBranchConfig, FNOConfig, HNOConfig, FNO2Config, FNO2BishopConfig,
-    V14AConfig, V14BConfig, V14CConfig, V15Config, V16Config,
+from dynamode.model.diffusion import SpectralDiffusion
+from dynamode.model.noise_schedule import format_noise_diagnostics, resolve_noise_schedule
+from dynamode.model.shake import shake_caca
+from dynamode.model.wrapper import (
+    SUPPORTED_MODEL_TYPES,
     SpectralConvBlockMixAmplitudeConfig,
-    SpectralConvBlockMixAmplitudeBondGraphRefinedConfig,
-    SpectralConvBlockMixAmplitudeEGNNConfig,
-    SpectralConvBlockMixAmplitudeRefinedConfig,
-    SpectralConvBlockMixAmplitudeSpectralGraphRefinedConfig,
-    SpectralConvBlockMixSlowHybridEGNNConfig,
-    SpectralConvBlockMixConfig, SpectralConvDiTConfig,
-    SpectralConvBlockMixSlowHybridConfig,
-    SpectralConvSlowBranchConfig, SpectralDiTConfig,
+    SpectralDiTConfig,
+    UnifiedWrapper,
 )
-from disco.spectral.representation import (
+from dynamode.spectral.conditioned_freq_scale import load_freq_scale_artifact
+from dynamode.spectral.representation import (
     CoordinateRepresentation,
     SpectralRepresentationPipeline,
     canonical_aniso_source,
@@ -69,12 +57,9 @@ from disco.spectral.representation import (
     canonical_freq_normalization,
     canonical_representation,
 )
-from disco.train import load_model_weights, run_inference
 
 
-# =============================================================================
 # Environment setup (matches src/test.py)
-# =============================================================================
 BACKEND = "nccl"
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("TORCH_NCCL_ENABLE_MONITORING", "0")
@@ -86,20 +71,15 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 
-# =============================================================================
 # Protocol constants (MarS-FM / MDGen defaults)
-# =============================================================================
 MDCATH_TOTAL_FRAMES = 500
 MDCATH_PRED_FRAMES = 500
 MDCATH_WINDOW_START_FRAMES = (0, 256)
 ATLAS_PRED_FRAMES = 100
 ATLAS_TOTAL_FRAMES = 100
-SOURCE_NAME_MAP = {0: "mdcath", 1: "atlas"}
 
 
-# =============================================================================
 # Generic helpers
-# =============================================================================
 def seed_everything(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -145,6 +125,304 @@ def maybe_barrier() -> None:
 def shard_items(items, rank: int, world_size: int):
     return items[rank::world_size]
 
+
+def maybe_restore_dc(
+    spectral_adapter,
+    x: torch.Tensor,
+    dc_baseline: torch.Tensor | None,
+    coord_channels: int,
+) -> torch.Tensor:
+    if (
+        spectral_adapter is None
+        or x is None
+        or dc_baseline is None
+        or not hasattr(spectral_adapter, "restore_dc")
+    ):
+        return x
+    return spectral_adapter.restore_dc(x, dc_baseline, coord_channels=coord_channels)
+
+
+def build_spectral_mask(
+    mask: torch.Tensor,
+    torsion_mask: torch.Tensor | None,
+    top_k: int,
+    is_dct: bool,
+    *,
+    coord_channels: int = 3,
+    representation: CoordinateRepresentation | None = None,
+) -> torch.Tensor:
+    '''Build the flattened spectral mask used by the sampler.'''
+    if representation is not None:
+        return representation.spectral_mask(mask, torsion_mask, top_k, is_dct)
+    mask_coords = mask.unsqueeze(-1).expand(-1, -1, coord_channels)
+    if torsion_mask is not None:
+        feature_mask = torch.cat([mask_coords, torsion_mask], dim=-1)
+    else:
+        feature_mask = mask_coords
+
+    if is_dct:
+        full = feature_mask.unsqueeze(2).expand(-1, -1, top_k, -1)
+        return full.reshape(feature_mask.shape[0], feature_mask.shape[1], -1)
+    full = feature_mask.unsqueeze(2).unsqueeze(-1).expand(-1, -1, top_k, -1, 2)
+    return full.reshape(feature_mask.shape[0], feature_mask.shape[1], -1)
+
+
+class CFGModelWrapper(torch.nn.Module):
+    '''Classifier-free guidance wrapper for the public UnifiedWrapper API.'''
+
+    def __init__(self, base_model, guidance_scale: float = 1.0):
+        super().__init__()
+        self.base_model = base_model
+        self.guidance_scale = float(guidance_scale)
+        self.prediction_target = getattr(base_model, "prediction_target", "noise")
+
+    def forward(
+        self,
+        x_t,
+        t,
+        norm_temps,
+        native_coords,
+        native_angles,
+        mask=None,
+        **kwargs,
+    ):
+        if self.guidance_scale <= 1.0:
+            return self.base_model({
+                "x": x_t,
+                "t": t,
+                "temp": norm_temps,
+                "native_coords": native_coords,
+                "native_angles": native_angles,
+                "mask": mask,
+                "cond_drop_mask": None,
+                **kwargs,
+            })
+
+        batch_size = x_t.shape[0]
+        device = x_t.device
+        cond_mask = torch.cat([
+            torch.zeros(batch_size, dtype=torch.bool, device=device),
+            torch.ones(batch_size, dtype=torch.bool, device=device),
+        ])
+        kwargs_dup = {
+            key: (torch.cat([value, value], dim=0) if torch.is_tensor(value) else value)
+            for key, value in kwargs.items()
+        }
+        out_d = self.base_model({
+            "x": torch.cat([x_t, x_t], dim=0),
+            "t": torch.cat([t, t], dim=0),
+            "temp": torch.cat([norm_temps, norm_temps], dim=0),
+            "native_coords": torch.cat([native_coords, native_coords], dim=0),
+            "native_angles": (
+                torch.cat([native_angles, native_angles], dim=0)
+                if native_angles is not None else None
+            ),
+            "mask": torch.cat([mask, mask], dim=0) if mask is not None else None,
+            "cond_drop_mask": cond_mask,
+            **kwargs_dup,
+        })
+        cond, uncond = torch.chunk(out_d, 2, dim=0)
+        return uncond + self.guidance_scale * (cond - uncond)
+
+
+def _drop_shape_incompatible_state_dict_keys(
+    state_dict: dict[str, torch.Tensor],
+    target_state_dict: dict[str, torch.Tensor],
+    log_fn=print,
+    prefix: str = "load",
+) -> dict[str, torch.Tensor]:
+    '''Remove same-name checkpoint tensors whose shapes do not match target.'''
+    filtered: dict[str, torch.Tensor] = {}
+    skipped: list[tuple[str, tuple[int, ...], tuple[int, ...]]] = []
+    for key, value in state_dict.items():
+        target_value = target_state_dict.get(key)
+        if (
+            target_value is not None
+            and torch.is_tensor(value)
+            and torch.is_tensor(target_value)
+            and tuple(value.shape) != tuple(target_value.shape)
+        ):
+            skipped.append((key, tuple(value.shape), tuple(target_value.shape)))
+            continue
+        filtered[key] = value
+
+    if skipped:
+        preview = ", ".join(
+            f"{key}: ckpt{src_shape}->model{dst_shape}"
+            for key, src_shape, dst_shape in skipped[:12]
+        )
+        more = "" if len(skipped) <= 12 else f", ... +{len(skipped) - 12} more"
+        log_fn(f"  {prefix}: shape-mismatched keys skipped = {preview}{more}")
+    return filtered
+
+def load_model_weights(checkpoint_path: str, model, device="cpu", log_fn=print):
+    '''Load model weights for public DynaMode checkpoints.'''
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+    elif isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+        state_dict = checkpoint["state_dict"]
+    else:
+        state_dict = checkpoint
+
+    target = model.module if hasattr(model, "module") else model
+    if any(key.startswith("module.") for key in state_dict):
+        state_dict = {
+            key.replace("module.", "", 1): value
+            for key, value in state_dict.items()
+        }
+    state_dict = _drop_shape_incompatible_state_dict_keys(
+        state_dict,
+        target.state_dict(),
+        log_fn=log_fn,
+        prefix="load",
+    )
+    result = target.load_state_dict(state_dict, strict=False)
+    if result.missing_keys:
+        log_fn(f"  load: missing keys (kept at init) = {result.missing_keys}")
+    if result.unexpected_keys:
+        log_fn(f"  load: unexpected keys (ignored)   = {result.unexpected_keys}")
+    return result
+
+
+def run_inference(
+    model,
+    diffusion,
+    transform_engine,
+    shape,
+    native_coords,
+    native_angles,
+    temps,
+    window_size,
+    mask=None,
+    torsion_mask=None,
+    device="cpu",
+    guidance_scale=1.0,
+    num_ode_steps=20,
+    displacement=True,
+    representation: CoordinateRepresentation | None = None,
+    win_pos=None,
+    rmsf_prior=None,
+    res_type=None,
+    dssp=None,
+    dc_baseline_per_res=None,
+) -> dict[str, torch.Tensor | None]:
+    '''Sample a spectral public model and decode it back to coordinates.'''
+    model.eval()
+    real_model = model.module if hasattr(model, "module") else model
+    inner = getattr(real_model, "model", real_model)
+    is_dct = getattr(real_model, "is_dct", True)
+
+    needs_prior = getattr(inner, "use_rmsf_prior_gain", False)
+    if needs_prior and rmsf_prior is None:
+        raise ValueError(
+            "This checkpoint expects rmsf_prior, but evaluation did not receive one."
+        )
+
+    coord_channels = native_coords.shape[-1]
+    representation = representation or CoordinateRepresentation(
+        displacement=displacement,
+        coord_channels=coord_channels,
+    )
+    repr_coord_channels = representation.model_coord_channels
+    angle_channels = native_angles.shape[-1] if native_angles is not None else 0
+    channels = repr_coord_channels + angle_channels
+
+    batch_size, _, feature_dim = shape
+    complex_mult = 1 if is_dct else 2
+    top_k = feature_dim // (channels * complex_mult)
+
+    if native_angles is not None:
+        if torsion_mask is None and mask is not None:
+            torsion_mask = mask.unsqueeze(-1).expand(-1, -1, angle_channels)
+        elif torsion_mask is not None and torsion_mask.dim() == 2:
+            torsion_mask = torsion_mask.unsqueeze(-1).expand(-1, -1, angle_channels)
+    else:
+        torsion_mask = None
+
+    input_noise = diffusion.sample_initial_noise(shape, device=device)
+    spec_mask = None
+    if mask is not None:
+        spec_mask = build_spectral_mask(
+            mask,
+            torsion_mask,
+            top_k,
+            is_dct,
+            coord_channels=repr_coord_channels,
+            representation=representation,
+        )
+        input_noise = input_noise * spec_mask
+
+    norm_temps = torch.clamp((temps - 250.0) / 200.0, 0.0, 1.0)
+    cfg_model = CFGModelWrapper(real_model, guidance_scale=guidance_scale)
+    x_t = diffusion.denoise_ode(
+        cfg_model,
+        input_noise,
+        native_coords,
+        native_angles,
+        norm_temps,
+        mask,
+        torsion_mask=torsion_mask,
+        is_dct=is_dct,
+        num_steps=num_ode_steps,
+        win_pos=win_pos,
+        rmsf_prior=rmsf_prior,
+        res_type=res_type,
+        dssp=dssp,
+        spectral_mask=spec_mask,
+    )
+
+    dc_baseline = None
+    if dc_baseline_per_res is not None:
+        dc_baseline = dc_baseline_per_res.to(
+            device=x_t.device,
+            dtype=x_t.dtype,
+        )[..., :repr_coord_channels]
+    if hasattr(transform_engine, "lookup_dc_baselines") and dc_baseline is None:
+        dc_baseline = transform_engine.lookup_dc_baselines(
+            temps,
+            mask,
+            coord_channels=repr_coord_channels,
+            device=x_t.device,
+        )
+    x_t = maybe_restore_dc(transform_engine, x_t, dc_baseline, repr_coord_channels)
+
+    x_time = transform_engine.spectral_to_time(
+        x_t,
+        n_time_steps=window_size,
+        n_channels=channels,
+    )
+    if mask is not None:
+        x_time = x_time * mask.unsqueeze(1).unsqueeze(-1)
+    coord_repr_time = x_time[..., :repr_coord_channels]
+    coords_abs = representation.inverse(coord_repr_time, native_coords, mask=mask)
+
+    if getattr(inner, "use_shake", False):
+        if coords_abs.shape[-1] == 3:
+            coords_abs = shake_caca(
+                coords_abs,
+                mask=mask,
+                target=getattr(inner, "shake_target", 3.8),
+                n_iter=getattr(inner, "shake_n_iter", 20),
+            )
+        elif coords_abs.shape[-1] == 12:
+            ca_shaken = shake_caca(
+                coords_abs[..., 3:6],
+                mask=mask,
+                target=getattr(inner, "shake_target", 3.8),
+                n_iter=getattr(inner, "shake_n_iter", 20),
+            )
+            coords_abs = coords_abs.clone()
+            coords_abs[..., 3:6] = ca_shaken
+
+    pred_dict: dict[str, torch.Tensor | None] = {"coords": coords_abs, "spectral": x_t}
+    if angle_channels > 0:
+        pred_dict["angles"] = x_time[..., repr_coord_channels:]
+        if torsion_mask is not None:
+            pred_dict["angles"] = pred_dict["angles"] * torsion_mask.unsqueeze(1)
+    return pred_dict
+
+
 def flatten_yaml_config(path: str) -> dict:
     raw = yaml.safe_load(open(path)) or {}
     config = {}
@@ -157,50 +435,31 @@ def flatten_yaml_config(path: str) -> dict:
 
 def coerce_config_types(config: dict) -> dict:
     float_keys = [
-        "max_lr", "min_snr_gamma", "smoothing_sigma", "shift_value",
-        "guidance_scale", "shelf_value", "coord_scale", "bending_lambda",
-        "geometry_lambda", "aniso_gamma", "rmsf_lambda", "dc_lambda",
-        "slow_mlp_ratio", "slow_attn_dropout", "loss_slow_weight",
-        "loss_fast_weight", "loss_total_weight", "amp_head_mlp_ratio",
-        "amp_head_attn_dropout", "shake_target", "temporal_gate_init",
+        "min_snr_gamma", "shift_value", "guidance_scale", "aniso_gamma",
+        "amp_head_mlp_ratio", "amp_head_attn_dropout", "shake_target",
         "representation_length_min", "representation_length_max",
-        "representation_length_residual_max", "representation_barrier_lambda",
-        "refiner_max_delta", "spectral_graph_refiner_max_delta",
-        "bond_spectral_graph_refiner_max_delta", "bond_spectral_graph_refiner_blend",
+        "representation_length_residual_max", "caca_bond_target",
+        "caca_bond_tolerance", "caca_bond_step",
     ]
     int_keys = [
-        "epochs", "batch_size", "num_workers", "prefetch_factor",
-        "dataloader_timeout", "top_k_freqs", "hidden_dim", "freq_hidden_size",
-        "spectral_modes", "hidden_size", "jepa_latent_dim",
-        "seq_embed_dim", "ss_embed_dim", "num_layers",
+        "batch_size", "num_workers", "top_k_freqs", "freq_hidden_size",
+        "spectral_modes", "seq_embed_dim", "ss_embed_dim", "num_layers",
         "num_heads", "num_steps", "num_ode_steps", "max_domains", "atlas_stride",
-        "n_repeats", "pairwise_rmsd_samples", "hist_bins", "conditioning_rep",
+        "n_repeats", "pairwise_rmsd_samples", "hist_bins", "cond_dim",
         "mdcath_total_frames", "mdcath_pred_frames", "atlas_pred_frames",
-        "atlas_total_frames", "spectral_volume_hist_bins", "K_slow", "slow_mode_start", "slow_d_model", "slow_depth",
-        "slow_num_heads", "fast_cond_dim", "amp_head_context_modes",
+        "atlas_total_frames", "spectral_volume_hist_bins", "amp_head_context_modes",
         "amp_head_target_modes", "amp_head_d_model", "amp_head_depth",
-        "amp_head_num_heads", "egnn_h_dim", "egnn_hidden", "egnn_depth",
-        "egnn_seq_window", "egnn_max_len", "egnn_t_chunk",
-        "shake_n_iter", "refiner_hidden", "refiner_depth", "refiner_kernel_size",
-        "spectral_graph_refiner_modes", "spectral_graph_refiner_hidden",
-        "spectral_graph_refiner_depth", "spectral_graph_refiner_msg_hidden",
-        "spectral_graph_refiner_sequence_window", "spectral_graph_refiner_knn",
-        "bond_spectral_graph_refiner_modes", "bond_spectral_graph_refiner_hidden",
-        "bond_spectral_graph_refiner_depth", "bond_spectral_graph_refiner_msg_hidden",
-        "bond_spectral_graph_refiner_sequence_window", "bond_spectral_graph_refiner_knn",
+        "amp_head_num_heads", "shake_n_iter", "caca_bond_n_iter",
     ]
     bool_keys = [
         "use_DCT", "displacement", "use_zarr", "include_angles",
-        "persistent_workers", "use_seq_conditioning", "use_ss_conditioning",
+        "use_seq_conditioning", "use_ss_conditioning",
         "conditioning_dropout", "use_hilbert_spatial", "use_hilbert_spatial_dct",
         "use_rmsf_prior_gain", "use_low_k_correction_head", "save_trajectories",
-        "save_caca_pair_distributions",
-        "slow_use_rmsf_prior", "slow_predicts_amplitude_only",
+        "save_caca_pair_distributions", "normalize_caca_bonds",
         "amp_head_use_rmsf_prior", "use_shake", "compute_spectral_volume_metrics",
-        "use_spectral_graph_refiner", "spectral_graph_refiner_use_sequence_edges",
-        "spectral_graph_refiner_use_native_knn", "use_bond_spectral_graph_refiner",
-        "bond_spectral_graph_refiner_use_sequence_edges",
-        "bond_spectral_graph_refiner_use_native_knn",
+        "compute_spectral_metrics", "eval_mdcath", "eval_atlas",
+        "noise_auto_shift",
     ]
     for key in float_keys:
         if key in config and config[key] is not None:
@@ -250,7 +509,7 @@ def read_id_set(path: str | None):
         return {line.strip() for line in f if line.strip()}
 
 def merge_id_sets(*paths: str | None):
-    """Read one or more newline-delimited id files into a single filter set."""
+    '''Read one or more newline-delimited id files into a single filter set.'''
     merged = set()
     for path in paths:
         ids = read_id_set(path)
@@ -277,9 +536,9 @@ def std_or_nan(values) -> float:
     return float(np.std(np.asarray(vals, dtype=np.float64), ddof=1))
 
 
-# =============================================================================
 # Numerical / geometry helpers
 # =============================================================================
+
 def pearson_corr(x: np.ndarray, y: np.ndarray) -> float:
     x = np.asarray(x, dtype=np.float64).reshape(-1)
     y = np.asarray(y, dtype=np.float64).reshape(-1)
@@ -304,7 +563,7 @@ def spearman_corr(x: np.ndarray, y: np.ndarray) -> float:
     return pearson_corr(xr, yr)
 
 def kabsch_align_traj(traj: np.ndarray, ref_frame: np.ndarray) -> np.ndarray:
-    """Rigid-body superpose every frame of ``traj`` onto ``ref_frame`` using batched operations."""
+    '''Rigid-body superpose every frame of traj onto ref_frame using batched operations.'''
     # Center reference
     ref_c0 = ref_frame.mean(axis=0)
     ref_c = ref_frame - ref_c0
@@ -331,7 +590,7 @@ def kabsch_align_traj(traj: np.ndarray, ref_frame: np.ndarray) -> np.ndarray:
     return np.matmul(traj_c, R.transpose(0, 2, 1)) + ref_c0
 
 def compute_rmsf(ca_coords: np.ndarray) -> np.ndarray:
-    """Per-residue RMSF from (T, L, 3) CA trajectory."""
+    '''Per-residue RMSF from (T, L, 3) CA trajectory.'''
     mean = ca_coords.mean(axis=0, keepdims=True)
     sq = ((ca_coords - mean) ** 2).sum(axis=-1)
     return np.sqrt(sq.mean(axis=0) + 1e-8)
@@ -339,7 +598,7 @@ def compute_rmsf(ca_coords: np.ndarray) -> np.ndarray:
 def estimate_pairwise_rmsd(
     ca_coords: np.ndarray, n_pairs: int, rng: np.random.Generator
 ) -> np.ndarray:
-    """Return a sample of pairwise-RMSD values (length = n_pairs or fewer)."""
+    '''Return a sample of pairwise-RMSD values (length = n_pairs or fewer).'''
     T = ca_coords.shape[0]
     if T < 2:
         return np.array([], dtype=np.float64)
@@ -352,7 +611,9 @@ def estimate_pairwise_rmsd(
     diff = ca_coords[i] - ca_coords[j]
     return np.sqrt((diff ** 2).sum(axis=-1).mean(axis=-1) + 1e-8)
 
-# --- Distribution metrics (JSD / KL with binning) ----------------------------
+
+# Distribution metrics (JSD / KL with binning) 
+# ----------------------------
 def _histogram_probs(
     samples_a: np.ndarray, samples_b: np.ndarray, bins: int, eps: float = 1e-5
 ):
@@ -403,7 +664,8 @@ def fwd_kl_1d(p_samples: np.ndarray, q_samples: np.ndarray, bins: int = 100) -> 
     return float(np.sum(pa[mask] * (np.log(pa[mask]) - np.log(np.maximum(pb[mask], 1e-5)))))
 
 
-# --- Wasserstein (atom-wise gaussian) ----------------------------------------
+# Wasserstein (atom-wise gaussian)
+# ----------------------------------------
 def _covariance(x: np.ndarray) -> np.ndarray:
     if x.shape[0] < 2:
         return np.eye(x.shape[1], dtype=np.float64) * 1e-8
@@ -430,9 +692,10 @@ def _gaussian_w2_sq(
     return delta_sq + var_term, delta_sq, var_term
 
 def compute_rmwd(pred_ca: np.ndarray, ref_ca: np.ndarray) -> tuple[float, float, float]:
-    """Root Mean Wasserstein Distance (per-atom Gaussian W2, then sqrt-mean).
+    '''
+    Root Mean Wasserstein Distance (per-atom Gaussian W2, then sqrt-mean).
     Fully vectorized over atoms to eliminate Python loops.
-    """
+    '''
     T1, L, _ = pred_ca.shape
     T2 = ref_ca.shape[0]
 
@@ -472,7 +735,9 @@ def compute_rmwd(pred_ca: np.ndarray, ref_ca: np.ndarray) -> tuple[float, float,
         float(math.sqrt(np.mean(var_term))),
     )
 
-# --- PCA W2 ------------------------------------------------------------------
+
+# PCA W2 
+# ------------------------------------------------------------------
 def _top_pcs(x: torch.Tensor, n_components: int = 2):
     q = min(max(n_components, 2), x.shape[1], x.shape[0])
     mean = x.mean(dim=0, keepdim=True)
@@ -525,16 +790,16 @@ def compute_pca_metrics(pred_ca: np.ndarray, ref_ca: np.ndarray) -> tuple[float,
     ).item()))
     return float(math.sqrt(md_w2)), float(math.sqrt(joint_w2)), pc_sim
 
-
 def _pca_fit_transform_np(x: np.ndarray, n_components: int = 2):
-    """Lightweight PCA helper matching AlphaFlow-style projected coordinates.
+    '''
+    Lightweight PCA helper matching AlphaFlow-style projected coordinates.
 
-    Returns the mean, component matrix of shape ``(D, K)``, and transformed
-    coordinates ``(N, K)``. Also returns the leading explained variances so we
+    Returns the mean, component matrix of shape (D, K), and transformed
+    coordinates (N, K). Also returns the leading explained variances so we
     can track whether the first PC is well separated from the second one.
     Uses an SVD backend to avoid introducing a hard sklearn dependency into the
     evaluation script.
-    """
+    '''
     x = np.asarray(x, dtype=np.float64)
     if x.ndim != 2:
         raise ValueError(f"expected 2D array, got shape {x.shape}")
@@ -557,16 +822,14 @@ def _pca_fit_transform_np(x: np.ndarray, n_components: int = 2):
         explained_variance = np.zeros(k, dtype=np.float64)
     return mean.squeeze(0), basis, coords, explained_variance
 
-
 def _pca_transform_np(x: np.ndarray, mean: np.ndarray, basis: np.ndarray) -> np.ndarray:
     x = np.asarray(x, dtype=np.float64)
     if basis.size == 0:
         return np.zeros((x.shape[0], 0), dtype=np.float64)
     return (x - mean[None, :]) @ basis
 
-
 def _alphaflow_wasserstein(distmat: np.ndarray, p: int = 2) -> float:
-    """AlphaFlow-style assignment Wasserstein on a pairwise distance matrix."""
+    '''AlphaFlow-style assignment Wasserstein on a pairwise distance matrix.'''
     from scipy.optimize import linear_sum_assignment
 
     distmat = np.asarray(distmat, dtype=np.float64)
@@ -576,19 +839,18 @@ def _alphaflow_wasserstein(distmat: np.ndarray, p: int = 2) -> float:
     row_ind, col_ind = linear_sum_assignment(cost)
     return float(cost[row_ind, col_ind].mean() ** (1.0 / p))
 
-
 def _pc1_pc2_var_ratio(explained_variance: np.ndarray) -> float:
-    """Return a simple eigengap diagnostic for the first two PCs.
+    '''
+    Return a simple eigengap diagnostic for the first two PCs.
 
     Values close to 1 indicate that the leading direction is poorly separated
     from the second mode, making signed first-PC cosine much less stable.
-    """
+    '''
     explained_variance = np.asarray(explained_variance, dtype=np.float64)
     if explained_variance.size < 2:
         return float("nan")
     denom = max(float(explained_variance[1]), 1e-12)
     return float(explained_variance[0] / denom)
-
 
 def compute_alphaflow_pca_metrics(
     pred_ca: np.ndarray,
@@ -596,7 +858,8 @@ def compute_alphaflow_pca_metrics(
     rng: np.random.Generator,
     n_components: int = 2,
 ) -> tuple[float, float, float, float, float]:
-    """AlphaFlow-style PCA ensemble metrics.
+    '''
+    AlphaFlow-style PCA ensemble metrics.
 
     This follows the AlphaFlow ATLAS evaluation pattern more closely than the
     default Gaussian PCA-W2 metric above:
@@ -607,9 +870,9 @@ def compute_alphaflow_pca_metrics(
         fitted PCs of the reference and predicted ensembles.
 
     Coordinates in this evaluation pipeline are already in Angstroms, so we
-    keep AlphaFlow's per-atom normalisation by ``sqrt(n_atoms)`` but omit the
-    extra ``*10`` factor used there for MDTraj's nanometre units.
-    """
+    keep AlphaFlow's per-atom normalisation by sqrt(n_atoms) but omit the
+    extra *10 factor used there for MDTraj's nanometre units.
+    '''
     pred_flat = np.asarray(pred_ca, dtype=np.float64).reshape(pred_ca.shape[0], -1)
     ref_flat = np.asarray(ref_ca, dtype=np.float64).reshape(ref_ca.shape[0], -1)
     if pred_flat.shape[0] < 1 or ref_flat.shape[0] < 2:
@@ -669,12 +932,13 @@ def compute_alphaflow_pca_metrics(
     )
 
 
-# --- Contacts / FNC / ΔG_fold / Rg -------------------------------------------
+# Contacts / FNC / ΔG_fold / Rg 
+# -------------------------------------------
 def _upper_triangle_mask(n: int) -> np.ndarray:
     return np.triu(np.ones((n, n), dtype=bool), k=1)
 
 def contact_probability(ca_coords: np.ndarray, threshold: float = 8.0, chunk_size: int = 128) -> np.ndarray:
-    """Computes contact probability matrix via batched dist_sq formulation."""
+    '''Computes contact probability matrix via batched dist_sq formulation.'''
     T, L, _ = ca_coords.shape
     counts = np.zeros((L, L), dtype=np.int64)
     thresh_sq = threshold ** 2
@@ -754,9 +1018,10 @@ def compute_rg_traj(ca_coords: np.ndarray) -> np.ndarray:
     center = ca_coords.mean(axis=1, keepdims=True)
     return np.sqrt(((ca_coords - center) ** 2).sum(axis=-1).mean(axis=-1))
 
-# --- GDT-TS ------------------------------------------------------------------
+# GDT-TS 
+# ------------------------------------------------------------------
 def compute_gdt_ts(pred_ca: np.ndarray, ref_native_ca: np.ndarray) -> np.ndarray:
-    """Per-frame GDT-TS with broadcasted comparisons rather than a temporal loop."""
+    '''Per-frame GDT-TS with broadcasted comparisons rather than a temporal loop.'''
     aligned = kabsch_align_traj(pred_ca.astype(np.float64), ref_native_ca.astype(np.float64))
     
     # Calculate distance squared to avoid sqrt (d_sq shape: [T, L])
@@ -769,7 +1034,8 @@ def compute_gdt_ts(pred_ca: np.ndarray, ref_native_ca: np.ndarray) -> np.ndarray
     # Mean over residues (L), then mean over the 4 cutoffs
     return hits.mean(axis=1).mean(axis=-1)
 
-
+# LDDT
+# ------------------------------------------------------------------
 def compute_lddt_ca(
     ca_traj: np.ndarray,
     ref_ca: np.ndarray,
@@ -777,12 +1043,13 @@ def compute_lddt_ca(
     tolerances: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0),
     chunk_size: int = 128,
 ) -> np.ndarray:
-    """Per-frame CA-only lDDT against a static reference structure.
+    '''
+    Per-frame CA-only lDDT against a static reference structure.
 
     This mirrors the project validation lDDT definition but avoids materialising
-    a full ``T x L x L`` distance tensor. Native/reference CA pairs within
-    ``cutoff`` Angstrom are scored by the usual four tolerance bands.
-    """
+    a full T x L x L distance tensor. Native/reference CA pairs within
+    cutoff Angstrom are scored by the usual four tolerance bands.
+    '''
     ca = np.asarray(ca_traj, dtype=np.float32)
     ref = np.asarray(ref_ca, dtype=np.float32)
     T, L, _ = ca.shape
@@ -807,14 +1074,15 @@ def compute_lddt_ca(
         out[start:end] = (err[..., None] < tol[None, None, :]).mean(axis=(1, 2))
     return out
 
-# --- Ca-Ca distances and DSSP fractions --------------------------------------
+# Ca-Ca distances and DSSP fractions 
+# --------------------------------------
 def compute_caca_distances(ca_coords: np.ndarray) -> np.ndarray:
     diff = ca_coords[:, 1:, :] - ca_coords[:, :-1, :]
     return np.linalg.norm(diff, axis=-1).mean(axis=-1)
 
 
 def compute_caca_pair_distances(ca_coords: np.ndarray) -> np.ndarray:
-    """All adjacent CA-CA bond distances, flattened over frames and residues."""
+    '''All adjacent CA-CA bond distances, flattened over frames and residues.'''
     diff = ca_coords[:, 1:, :] - ca_coords[:, :-1, :]
     return np.linalg.norm(diff, axis=-1).reshape(-1)
 
@@ -822,8 +1090,8 @@ def compute_caca_pair_distances(ca_coords: np.ndarray) -> np.ndarray:
 def compute_min_nonbonded_caca(
     ca_coords: np.ndarray, min_sep: int = 2
 ) -> np.ndarray:
-    """Per-frame minimum CA-CA distance between residues separated by
-    ``>=min_sep`` positions along the chain.
+    '''Per-frame minimum CA-CA distance between residues separated by
+    >=min_sep positions along the chain.
 
     A clash proxy: values below ~3.5 A indicate likely steric overlap since
     two CA atoms further than one bond apart cannot physically be closer
@@ -831,7 +1099,7 @@ def compute_min_nonbonded_caca(
 
     Returns:
         (T,) float array. Frames with L < min_sep+1 return +inf.
-    """
+    '''
     T, L, _ = ca_coords.shape
     if L < min_sep + 1:
         return np.full(T, np.inf, dtype=np.float64)
@@ -849,12 +1117,13 @@ def compute_nonbonded_caca_metrics(
     min_sep: int = 2,
     thresholds: tuple[float, ...] = (2.5, 3.0, 3.5),
 ) -> dict:
-    """Per-frame non-bonded CA-CA minimum distances and clash counts.
+    '''
+    Per-frame non-bonded CA-CA minimum distances and clash counts.
 
-    Counts are over all residue pairs separated by at least ``min_sep`` along
+    Counts are over all residue pairs separated by at least min_sep along
     sequence. A threshold of 3.5 A is the broad steric-overlap warning used
     elsewhere in this evaluator; 3.0/2.5 A are stricter severe-clash cutoffs.
-    """
+    '''
     T, L, _ = ca_coords.shape
     out = {"pair_min": np.full(T, np.inf, dtype=np.float64)}
     for thr in thresholds:
@@ -874,7 +1143,6 @@ def compute_nonbonded_caca_metrics(
             out[f"pair_count_lt_{tag}"] += (d < thr).sum(axis=-1)
     return out
 
-
 def segment_segment_distances_np(
     p1: np.ndarray,
     q1: np.ndarray,
@@ -882,12 +1150,13 @@ def segment_segment_distances_np(
     q2: np.ndarray,
     eps: float = 1e-8,
 ) -> np.ndarray:
-    """Closest distances between batched 3D line segments.
+    '''
+    Closest distances between batched 3D line segments.
 
-    Inputs broadcast over leading dimensions and end in ``(..., 3)``.
+    Inputs broadcast over leading dimensions and end in (..., 3).
     Implementation follows the standard closest-points-on-two-segments
     formulation, with clamped segment parameters.
-    """
+    '''
     u = q1 - p1
     v = q2 - p2
     w = p1 - p2
@@ -910,7 +1179,6 @@ def segment_segment_distances_np(
     closest_2 = p2 + t[..., None] * v
     return np.linalg.norm(closest_1 - closest_2, axis=-1)
 
-
 def compute_chain_segment_metrics(
     ca_coords: np.ndarray,
     min_segment_sep: int = 2,
@@ -918,13 +1186,14 @@ def compute_chain_segment_metrics(
     frame_chunk: int = 32,
     pair_chunk: int = 32768,
 ) -> dict:
-    """Per-frame non-adjacent CA-chain segment self-intersection proxies.
+    '''
+    Per-frame non-adjacent CA-chain segment self-intersection proxies.
 
-    Segment ``i`` connects residue ``i`` to ``i+1``. Segment pairs with
-    ``|i-j| < min_segment_sep`` are excluded because neighbouring segments
+    Segment i connects residue i to i+1. Segment pairs with
+    |i-j| < min_segment_sep are excluded because neighbouring segments
     share local chain geometry by construction. Exact intersections are rare in
     floating point 3D, so thresholds report near-intersections.
-    """
+    '''
     ca = np.asarray(ca_coords, dtype=np.float32)
     T, L, _ = ca.shape
     S = L - 1
@@ -979,7 +1248,6 @@ def compute_chain_segment_metrics(
         out[f"segment_frac_pairs_lt_{tag}"] = counts[thr] / max(float(n_pairs), 1.0)
     return out
 
-
 def normalize_caca_bonds(
     ca_coords: np.ndarray,
     target: float = 3.8,
@@ -987,29 +1255,28 @@ def normalize_caca_bonds(
     tolerance: float = 0.0,
     step: float = 0.5,
 ) -> np.ndarray:
-    """SHAKE-style symmetric CA-CA bond projection, with softening knobs.
+    '''
+    SHAKE-style symmetric CA-CA bond projection, with softening knobs.
 
     Each iteration shifts the two bonded atoms symmetrically toward the
-    target length. ``tolerance`` disables correction for bonds whose length
-    already lies within ``[target - tolerance, target + tolerance]`` — this
+    target length. tolerance disables correction for bonds whose length
+    already lies within [target - tolerance, target + tolerance] — this
     leaves thermally-reasonable bonds alone and only collapses far outliers
-    toward the upper/lower edge of the tolerance band. ``step`` scales the
+    toward the upper/lower edge of the tolerance band. step scales the
     per-iteration shift (0.5 = full symmetric correction, as in classical
     SHAKE; smaller values produce softer / partial projection).
 
-    Args:
-        ca_coords: (T, L, 3) array of CA coordinates.
-        target: ideal CA-CA bond length in Angstroms.
-        n_iter: number of iterations.
-        tolerance: half-width of the "don't touch" band around ``target``.
-            A value of ~0.03–0.05 Å reproduces the MD thermal spread (σ ≈
-            0.009, IQR ≈ ±0.02).
-        step: per-iteration correction fraction (0 < step ≤ 0.5).
+    ca_coords = (T, L, 3) array of CA coordinates.
+    target = ideal CA-CA bond length in Angstroms.
+    n_iter = number of iterations.
+    tolerance = half-width of the "don't touch" band around target.
+                A value of ~0.03–0.05 Å reproduces the MD thermal spread (σ ≈
+                0.009, IQR ≈ ±0.02).
+    step = per-iteration correction fraction (0 < step ≤ 0.5).
 
-    Returns:
-        (T, L, 3) array with consecutive CA-CA distances inside
-        ``[target - tolerance, target + tolerance]`` (when converged).
-    """
+    Returns (T, L, 3) array with consecutive CA-CA distances inside
+    [target - tolerance, target + tolerance] (when converged).
+    '''
     out = ca_coords.copy()
     T, L, _ = out.shape
     if L < 2:
@@ -1030,7 +1297,8 @@ def normalize_caca_bonds(
 def compute_dssp_fractions_from_traj(ca_coords: np.ndarray, native_dssp_onehot: np.ndarray) -> np.ndarray:
     return np.full(ca_coords.shape[0], np.nan, dtype=np.float64)
 
-# --- Spectral recovery (my-model only) ---------------------------------------
+# Spectral recovery
+# ---------------------------------------
 def compute_spectral_bands(
     ca_coords: np.ndarray, low_end: int = 8, mid_end: int = 64
 ) -> dict:
@@ -1059,7 +1327,6 @@ def compute_spectral_bands(
         "amp_per_mode": amp,
     }
 
-
 def spectral_amplitude_recovery(ref_amp: np.ndarray, pred_amp: np.ndarray) -> float:
     ref_amp = np.asarray(ref_amp, dtype=np.float64)
     pred_amp = np.asarray(pred_amp, dtype=np.float64)
@@ -1072,7 +1339,7 @@ def spectral_amplitude_recovery(ref_amp: np.ndarray, pred_amp: np.ndarray) -> fl
     return float(np.mean(1.0 - np.abs(pred_amp - ref_amp) / denom))
 
 def concordance_corrcoef(x: np.ndarray, y: np.ndarray) -> float:
-    """Lin's concordance correlation coefficient: correlation plus calibration."""
+    '''Lin's concordance correlation coefficient: correlation plus calibration.'''
     x = np.asarray(x, dtype=np.float64).reshape(-1)
     y = np.asarray(y, dtype=np.float64).reshape(-1)
     mask = np.isfinite(x) & np.isfinite(y)
@@ -1149,7 +1416,8 @@ def top_fraction_jaccard(ref_scores: np.ndarray, pred_scores: np.ndarray, fracti
     return float(len(ref_top & pred_top) / len(union))
 
 
-# --- Direct spectral-volume prediction metrics -------------------------------
+# Spectral-volume prediction metrics 
+# --------------------------------------
 SPECTRAL_VOLUME_BANDS = (
     ("whole", None, None),
     ("dc", 0, 0),
@@ -1159,9 +1427,8 @@ SPECTRAL_VOLUME_BANDS = (
     ("high", 65, 128),
 )
 
-
 def spectral_volume_band_indices(k_total: int) -> dict[str, np.ndarray]:
-    """Return clipped DCT band indices for the configured spectral volume."""
+    '''Return clipped DCT band indices for the configured spectral volume.'''
     bands = {}
     for name, lo, hi in SPECTRAL_VOLUME_BANDS:
         if name == "whole":
@@ -1175,9 +1442,8 @@ def spectral_volume_band_indices(k_total: int) -> dict[str, np.ndarray]:
             bands[name] = idx
     return bands
 
-
 def spectral_flat_to_dct_volume(x_flat: np.ndarray, n_channels: int) -> np.ndarray:
-    """Reshape `(L, K*C)` DCT features to `(L, K, C)`."""
+    '''Reshape (L, K*C) DCT features to (L, K, C).'''
     x_flat = np.asarray(x_flat, dtype=np.float64)
     if x_flat.ndim != 2:
         raise ValueError(f"expected flat spectral array of shape (L,D), got {x_flat.shape}")
@@ -1187,7 +1453,6 @@ def spectral_flat_to_dct_volume(x_flat: np.ndarray, n_channels: int) -> np.ndarr
         )
     return x_flat.reshape(x_flat.shape[0], x_flat.shape[-1] // int(n_channels), int(n_channels))
 
-
 def compute_spectral_volume_metrics(
     pred_volume: np.ndarray,
     ref_volumes: np.ndarray,
@@ -1196,12 +1461,13 @@ def compute_spectral_volume_metrics(
     hist_bins: int,
     eps: float = 1e-8,
 ) -> dict[str, dict[str, float]]:
-    """Compare one predicted DCT volume against a same-window GT replicate ensemble.
+    '''
+    Compare one predicted DCT volume against a same-window GT replicate ensemble.
 
-    `pred_volume` is `(L,K,C)`, while `ref_volumes` is `(R,L,K,C)`.
+    pred_volume is (L,K,C), while ref_volumes is (R,L,K,C).
     Direct coefficient metrics use the GT ensemble mean volume as the target.
     Distributional and energy metrics use the full GT replicate pool.
-    """
+    '''
     pred = np.asarray(pred_volume, dtype=np.float64)
     refs = np.asarray(ref_volumes, dtype=np.float64)
     if pred.ndim != 3 or refs.ndim != 4:
@@ -1248,7 +1514,6 @@ def compute_spectral_volume_metrics(
         }
     return out
 
-
 def summarise_spectral_volume_rows(rows: list[dict], prefix: str = "spectral_volume") -> dict:
     if not rows:
         return {}
@@ -1270,17 +1535,6 @@ def summarise_spectral_volume_rows(rows: list[dict], prefix: str = "spectral_vol
             summary[f"{prefix}/{band}/{key}_median"] = float(np.median(vals))
             summary[f"{prefix}/{band}/{key}_std"] = float(vals.std(ddof=1)) if vals.size > 1 else float("nan")
     return summary
-
-
-# =============================================================================
-# Model stack (reused from test_tempo_mdgen)
-# =============================================================================
-def get_transform_classes(use_dct: bool):
-    if use_dct:
-        from disco.spectral.adapters import DCT
-        return DCT
-    from disco.spectral.adapters import DFT
-    return DFT
 
 def build_model_stack(config: dict, device: torch.device):
     coords_type = config.get("coords_type", "ca")
@@ -1305,7 +1559,13 @@ def build_model_stack(config: dict, device: torch.device):
     window_size = int(config.get("window_size", 256))
     top_k_freqs = int(config.get("top_k_freqs", 64))
     use_dct = bool(config.get("use_DCT", True))
-    model_type = config.get("model_type", "spectral_dit")
+    model_type = str(config.get("model_type", "spectral_dit_low_k"))
+    if model_type not in SUPPORTED_MODEL_TYPES:
+        supported = ", ".join(SUPPORTED_MODEL_TYPES)
+        raise ValueError(
+            f"Unknown model_type={model_type!r}. This public evaluator supports: "
+            f"{supported}."
+        )
     freq_normalization = canonical_freq_normalization(config.get("freq_normalization", "auto"))
     dc_residualization = canonical_dc_residualization(config.get("dc_residualization", "auto"))
     aniso_source = canonical_aniso_source(config.get("aniso_source", "auto"))
@@ -1313,20 +1573,17 @@ def build_model_stack(config: dict, device: torch.device):
     freq_scales = None
     conditioned_freq_scale = None
     aniso_freq_scales = None
-    spectral_model = model_type not in ("fno", "hno", "fno2", "fno2_bishop", "v14a", "v14b", "v14c", "v15", "v16")
     expected_freq_dim = top_k_freqs * total_channels
-    needs_main_scale_artifact = False
     needs_aniso_artifact = config.get("aniso_scales_path") is not None
-    if spectral_model:
-        needs_main_scale_artifact = (
-            freq_normalization != "none"
-            or dc_residualization in {"bucket", "per_residue"}
-            or (dc_residualization == "auto" and config.get("freq_scales_path") is not None)
-            or aniso_source == "freq_scales"
-            or (aniso_source == "auto" and freq_normalization != "none")
-        )
+    needs_main_scale_artifact = (
+        freq_normalization != "none"
+        or dc_residualization in {"bucket", "per_residue"}
+        or (dc_residualization == "auto" and config.get("freq_scales_path") is not None)
+        or aniso_source == "freq_scales"
+        or (aniso_source == "auto" and freq_normalization != "none")
+    )
 
-    if spectral_model and (needs_main_scale_artifact or needs_aniso_artifact):
+    if needs_main_scale_artifact or needs_aniso_artifact:
         freq_scales_path = config.get("freq_scales_path")
         if needs_main_scale_artifact:
             if freq_scales_path is None or not os.path.exists(freq_scales_path):
@@ -1352,53 +1609,53 @@ def build_model_stack(config: dict, device: torch.device):
         use_dct=use_dct,
         scale_factors=freq_scales,
         conditioned_freq_scale=conditioned_freq_scale,
-        freq_normalization=freq_normalization if spectral_model else "none",
-        dc_residualization=dc_residualization if spectral_model else "none",
-        aniso_source=aniso_source if spectral_model else "none",
+        freq_normalization=freq_normalization,
+        dc_residualization=dc_residualization,
+        aniso_source=aniso_source,
         aniso_scale_factors=aniso_freq_scales,
         device=device,
     )
     freq_scales_for_model = transform_engine.model_freq_scale
     conditioned_freq_scale_for_model = transform_engine.model_conditioned_freq_scale
 
-    configs = {
-        "spectral_dit": SpectralDiTConfig(
-            in_channels=total_channels, cond_channels=coord_channels,
-            depth=config.get("num_layers", 12), num_heads=config.get("num_heads", 12),
-            top_k_freqs=top_k_freqs, freq_hidden_size=config.get("freq_hidden_size", 384),
+    if model_type == "spectral_dit_low_k":
+        model_config = SpectralDiTConfig(
+            in_channels=total_channels,
+            cond_channels=coord_channels,
+            depth=config.get("num_layers", 12),
+            num_heads=config.get("num_heads", 12),
+            top_k_freqs=top_k_freqs,
+            freq_hidden_size=config.get("freq_hidden_size", 384),
             prediction_target=config.get("prediction_target", "v"),
-            freq_scale=freq_scales_for_model, conditioned_freq_scale=conditioned_freq_scale_for_model,
-            cfg_dropout=config.get("conditioning_dropout", False), is_dct=use_dct,
-            use_seq_conditioning=config.get("use_seq_conditioning", False),
-            seq_embed_dim=config.get("seq_embed_dim", 16),
-            use_ss_conditioning=config.get("use_ss_conditioning", False),
-            ss_embed_dim=config.get("ss_embed_dim", 8),
-        ),
-        "spectral_dit_low_k": SpectralDiTConfig(
-            in_channels=total_channels, cond_channels=coord_channels,
-            depth=config.get("num_layers", 12), num_heads=config.get("num_heads", 12),
-            top_k_freqs=top_k_freqs, freq_hidden_size=config.get("freq_hidden_size", 384),
-            prediction_target=config.get("prediction_target", "v"),
-            freq_scale=freq_scales_for_model, conditioned_freq_scale=conditioned_freq_scale_for_model,
-            cfg_dropout=config.get("conditioning_dropout", False), is_dct=use_dct,
+            freq_scale=freq_scales_for_model,
+            conditioned_freq_scale=conditioned_freq_scale_for_model,
+            cfg_dropout=config.get("conditioning_dropout", False),
+            is_dct=use_dct,
             use_seq_conditioning=config.get("use_seq_conditioning", False),
             seq_embed_dim=config.get("seq_embed_dim", 16),
             use_ss_conditioning=config.get("use_ss_conditioning", False),
             ss_embed_dim=config.get("ss_embed_dim", 8),
             use_low_k_correction_head=True,
             low_k_correction_modes=config.get("low_k_correction_modes", 1),
-        ),
-        "spectral_conv_dit": SpectralConvDiTConfig(
-            in_channels=total_channels, cond_channels=coord_channels,
-            depth=config.get("num_layers", 12), num_heads=config.get("num_heads", 12),
-            top_k_freqs=top_k_freqs, freq_hidden_size=config.get("freq_hidden_size", 384),
+            cond_dim=config.get("cond_dim", 512),
+        )
+    else:
+        model_config = SpectralConvBlockMixAmplitudeConfig(
+            in_channels=total_channels,
+            cond_channels=coord_channels,
+            depth=config.get("num_layers", 12),
+            num_heads=config.get("num_heads", 8),
+            top_k_freqs=top_k_freqs,
+            freq_hidden_size=config.get("freq_hidden_size", 12),
             spectral_modes=config.get("spectral_modes", top_k_freqs),
-            prediction_target=config.get("prediction_target", "v"),
-            freq_scale=freq_scales_for_model, conditioned_freq_scale=conditioned_freq_scale_for_model,
-            cfg_dropout=config.get("conditioning_dropout", False), is_dct=use_dct,
+            prediction_target=config.get("prediction_target", "x_0"),
+            freq_scale=freq_scales_for_model,
+            conditioned_freq_scale=conditioned_freq_scale_for_model,
+            cfg_dropout=config.get("conditioning_dropout", False),
+            is_dct=use_dct,
             use_hilbert=config.get("use_hilbert_spatial", False),
             use_hilbert_dct=config.get("use_hilbert_spatial_dct", False),
-            hilbert_mode=config.get("hilbert_mode", "every_block"),
+            hilbert_mode=config.get("hilbert_mode", "input_only"),
             use_rmsf_prior_gain=config.get("use_rmsf_prior_gain", False),
             use_low_k_correction_head=config.get("use_low_k_correction_head", False),
             low_k_correction_modes=config.get("low_k_correction_modes", 1),
@@ -1406,188 +1663,8 @@ def build_model_stack(config: dict, device: torch.device):
             seq_embed_dim=config.get("seq_embed_dim", 16),
             use_ss_conditioning=config.get("use_ss_conditioning", False),
             ss_embed_dim=config.get("ss_embed_dim", 8),
-        ),
-        "fno": FNOConfig(
-            in_channels=coord_channels, cond_channels=coord_channels,
-            depth=config.get("num_layers", 12), num_heads=config.get("num_heads", 12),
-            window_size=window_size, hidden_per_time=config.get("freq_hidden_size", 384),
-            spectral_modes=config.get("spectral_modes", top_k_freqs),
-            coord_scale=config.get("coord_scale", 1.0),
-            use_dropout=config.get("conditioning_dropout", False),
-            prediction_target=config.get("prediction_target", "v"),
-        ),
-        "hno": HNOConfig(
-            in_channels=coord_channels, cond_channels=coord_channels,
-            depth=config.get("num_layers", 12), num_heads=config.get("num_heads", 12),
-            window_size=window_size, hidden_per_time=config.get("freq_hidden_size", 384),
-            spectral_modes=config.get("spectral_modes", top_k_freqs),
-            coord_scale=config.get("coord_scale", 1.0),
-            use_dropout=config.get("conditioning_dropout", False),
-            prediction_target=config.get("prediction_target", "v"),
-        ),
-        "fno2": FNO2Config(
-            in_channels=coord_channels, cond_channels=coord_channels,
-            depth=config.get("num_layers", 12), num_heads=config.get("num_heads", 12),
-            window_size=window_size, hidden_per_time=max(config.get("freq_hidden_size", 16), 8),
-            spectral_modes=config.get("spectral_modes", top_k_freqs),
-            coord_scale=config.get("coord_scale", 1.0),
-            use_dropout=config.get("conditioning_dropout", False),
-            prediction_target=config.get("prediction_target", "v"),
-            use_seq_conditioning=config.get("use_seq_conditioning", True),
-            seq_embed_dim=config.get("seq_embed_dim", 16),
-            use_ss_conditioning=config.get("use_ss_conditioning", True),
-            ss_embed_dim=config.get("ss_embed_dim", 8),
-        ),
-        "fno2_bishop": FNO2BishopConfig(
-            in_channels=coord_channels, cond_channels=coord_channels,
-            depth=config.get("num_layers", 12), num_heads=config.get("num_heads", 12),
-            window_size=window_size, hidden_per_time=max(config.get("freq_hidden_size", 16), 8),
-            spectral_modes=config.get("spectral_modes", top_k_freqs),
-            coord_scale=config.get("coord_scale", 1.0),
-            use_dropout=config.get("conditioning_dropout", False),
-            prediction_target=config.get("prediction_target", "v"),
-            use_seq_conditioning=config.get("use_seq_conditioning", True),
-            seq_embed_dim=config.get("seq_embed_dim", 16),
-            use_ss_conditioning=config.get("use_ss_conditioning", True),
-            ss_embed_dim=config.get("ss_embed_dim", 8),
-        ),
-        "v15": V15Config(
-            in_channels=coord_channels, cond_channels=coord_channels,
-            depth=config.get("num_layers", 12), num_heads=config.get("num_heads", 12),
-            window_size=window_size, hidden_per_time=max(config.get("freq_hidden_size", 16), 8),
-            spectral_modes=config.get("spectral_modes", 4),
-            coord_scale=config.get("coord_scale", 1.0),
-            use_dropout=config.get("conditioning_dropout", False),
-            prediction_target=config.get("prediction_target", "v"),
-            use_seq_conditioning=config.get("use_seq_conditioning", True),
-            seq_embed_dim=config.get("seq_embed_dim", 16),
-            use_ss_conditioning=config.get("use_ss_conditioning", True),
-            ss_embed_dim=config.get("ss_embed_dim", 8),
-            temporal_ablation_mode=config.get("temporal_ablation_mode", "normal"),
-            block_ablation_mode=config.get("block_ablation_mode", "normal"),
-            temporal_gate_init=config.get("temporal_gate_init", 0.0),
-        ),
-        "v16": V16Config(
-            in_channels=coord_channels, cond_channels=coord_channels,
-            depth=config.get("num_layers", 12), num_heads=config.get("num_heads", 12),
-            window_size=window_size, hidden_per_time=max(config.get("freq_hidden_size", 16), 8),
-            spectral_modes=config.get("spectral_modes", 4),
-            coord_scale=config.get("coord_scale", 1.0),
-            use_dropout=config.get("conditioning_dropout", False),
-            prediction_target=config.get("prediction_target", "v"),
-            use_seq_conditioning=config.get("use_seq_conditioning", True),
-            seq_embed_dim=config.get("seq_embed_dim", 16),
-            use_ss_conditioning=config.get("use_ss_conditioning", True),
-            ss_embed_dim=config.get("ss_embed_dim", 8),
-            temporal_ablation_mode=config.get("temporal_ablation_mode", "normal"),
-            block_ablation_mode=config.get("block_ablation_mode", "normal"),
-            temporal_gate_init=config.get("temporal_gate_init", 0.0),
-        ),
-        "v14a": V14AConfig(
-            in_channels=coord_channels, cond_channels=coord_channels,
-            depth=config.get("num_layers", 12), num_heads=config.get("num_heads", 12),
-            window_size=window_size, hidden_size=config.get("hidden_size", max(config.get("freq_hidden_size", 16) * 16, 128)),
-            spectral_modes=config.get("spectral_modes", top_k_freqs),
-            coord_scale=config.get("coord_scale", 1.0),
-            use_dropout=config.get("conditioning_dropout", False),
-            prediction_target=config.get("prediction_target", "v"),
-            use_seq_conditioning=config.get("use_seq_conditioning", True),
-            seq_embed_dim=config.get("seq_embed_dim", 16),
-            use_ss_conditioning=config.get("use_ss_conditioning", True),
-            ss_embed_dim=config.get("ss_embed_dim", 8),
-        ),
-        "v14b": V14BConfig(
-            in_channels=coord_channels, cond_channels=coord_channels,
-            depth=config.get("num_layers", 12), num_heads=config.get("num_heads", 12),
-            window_size=window_size, hidden_size=config.get("hidden_size", max(config.get("freq_hidden_size", 16) * 16, 128)),
-            spectral_modes=config.get("spectral_modes", top_k_freqs),
-            coord_scale=config.get("coord_scale", 1.0),
-            use_dropout=config.get("conditioning_dropout", False),
-            prediction_target=config.get("prediction_target", "v"),
-            use_seq_conditioning=config.get("use_seq_conditioning", True),
-            seq_embed_dim=config.get("seq_embed_dim", 16),
-            use_ss_conditioning=config.get("use_ss_conditioning", True),
-            ss_embed_dim=config.get("ss_embed_dim", 8),
-        ),
-        "v14c": V14CConfig(
-            in_channels=coord_channels, cond_channels=coord_channels,
-            depth=config.get("num_layers", 12), num_heads=config.get("num_heads", 12),
-            window_size=window_size, hidden_size=config.get("hidden_size", max(config.get("freq_hidden_size", 16) * 16, 128)),
-            spectral_modes=config.get("spectral_modes", top_k_freqs),
-            coord_scale=config.get("coord_scale", 1.0),
-            use_dropout=config.get("conditioning_dropout", False),
-            prediction_target=config.get("prediction_target", "v"),
-            use_seq_conditioning=config.get("use_seq_conditioning", True),
-            seq_embed_dim=config.get("seq_embed_dim", 16),
-            use_ss_conditioning=config.get("use_ss_conditioning", True),
-            ss_embed_dim=config.get("ss_embed_dim", 8),
-            jepa_latent_dim=config.get("jepa_latent_dim", 128),
-        ),
-        "spectral_conv_slow_branch": SpectralConvSlowBranchConfig(
-            in_channels=total_channels, cond_channels=coord_channels,
-            depth=config.get("num_layers", 12), num_heads=config.get("num_heads", 8),
-            top_k_freqs=top_k_freqs, freq_hidden_size=config.get("freq_hidden_size", 12),
-            spectral_modes=config.get("spectral_modes", top_k_freqs),
-            prediction_target=config.get("prediction_target", "x_0"),
-            freq_scale=freq_scales_for_model, cfg_dropout=config.get("conditioning_dropout", False), is_dct=use_dct,
-            conditioned_freq_scale=conditioned_freq_scale_for_model,
-            use_hilbert=config.get("use_hilbert_spatial", False),
-            use_hilbert_dct=config.get("use_hilbert_spatial_dct", False),
-            hilbert_mode=config.get("hilbert_mode", "input_only"),
-            use_rmsf_prior_gain=config.get("use_rmsf_prior_gain", False),
-            use_low_k_correction_head=config.get("use_low_k_correction_head", False),
-            low_k_correction_modes=config.get("low_k_correction_modes", None),
-            use_seq_conditioning=config.get("use_seq_conditioning", False),
-            seq_embed_dim=config.get("seq_embed_dim", 16),
-            use_ss_conditioning=config.get("use_ss_conditioning", False),
-            ss_embed_dim=config.get("ss_embed_dim", 8),
-            K_slow=config.get("K_slow", 16),
-            slow_d_model=config.get("slow_d_model", 192),
-            slow_depth=config.get("slow_depth", 6),
-            slow_num_heads=config.get("slow_num_heads", 4),
-            slow_mlp_ratio=config.get("slow_mlp_ratio", 4.0),
-            slow_attn_dropout=config.get("slow_attn_dropout", 0.0),
-            slow_use_rmsf_prior=config.get("slow_use_rmsf_prior", False),
-        ),
-        "spectral_conv_block_mix": SpectralConvBlockMixConfig(
-            in_channels=total_channels, cond_channels=coord_channels,
-            depth=config.get("num_layers", 12), num_heads=config.get("num_heads", 8),
-            top_k_freqs=top_k_freqs, freq_hidden_size=config.get("freq_hidden_size", 12),
-            spectral_modes=config.get("spectral_modes", top_k_freqs),
-            prediction_target=config.get("prediction_target", "x_0"),
-            freq_scale=freq_scales_for_model, cfg_dropout=config.get("conditioning_dropout", False), is_dct=use_dct,
-            conditioned_freq_scale=conditioned_freq_scale_for_model,
-            use_hilbert=config.get("use_hilbert_spatial", False),
-            use_hilbert_dct=config.get("use_hilbert_spatial_dct", False),
-            hilbert_mode=config.get("hilbert_mode", "input_only"),
-            use_rmsf_prior_gain=config.get("use_rmsf_prior_gain", False),
-            use_low_k_correction_head=config.get("use_low_k_correction_head", False),
-            low_k_correction_modes=config.get("low_k_correction_modes", None),
-            use_seq_conditioning=config.get("use_seq_conditioning", False),
-            seq_embed_dim=config.get("seq_embed_dim", 16),
-            use_ss_conditioning=config.get("use_ss_conditioning", False),
-            ss_embed_dim=config.get("ss_embed_dim", 8),
-            band_edges=config.get("fast_band_edges", None),
-        ),
-        "spectral_conv_block_mix_amplitude": SpectralConvBlockMixAmplitudeConfig(
-            in_channels=total_channels, cond_channels=coord_channels,
-            depth=config.get("num_layers", 12), num_heads=config.get("num_heads", 8),
-            top_k_freqs=top_k_freqs, freq_hidden_size=config.get("freq_hidden_size", 12),
-            spectral_modes=config.get("spectral_modes", top_k_freqs),
-            prediction_target=config.get("prediction_target", "x_0"),
-            freq_scale=freq_scales_for_model, cfg_dropout=config.get("conditioning_dropout", False), is_dct=use_dct,
-            conditioned_freq_scale=conditioned_freq_scale_for_model,
-            use_hilbert=config.get("use_hilbert_spatial", False),
-            use_hilbert_dct=config.get("use_hilbert_spatial_dct", False),
-            hilbert_mode=config.get("hilbert_mode", "input_only"),
-            use_rmsf_prior_gain=config.get("use_rmsf_prior_gain", False),
-            use_low_k_correction_head=config.get("use_low_k_correction_head", False),
-            low_k_correction_modes=config.get("low_k_correction_modes", None),
-            use_seq_conditioning=config.get("use_seq_conditioning", False),
-            seq_embed_dim=config.get("seq_embed_dim", 16),
-            use_ss_conditioning=config.get("use_ss_conditioning", False),
-            ss_embed_dim=config.get("ss_embed_dim", 8),
-            band_edges=config.get("fast_band_edges", None),
+            cond_dim=config.get("cond_dim", 512),
+            band_edges=config.get("band_edges", None),
             amp_head_context_modes=config.get("amp_head_context_modes", 4),
             amp_head_target_modes=config.get("amp_head_target_modes", 1),
             amp_head_d_model=config.get("amp_head_d_model", 128),
@@ -1596,269 +1673,12 @@ def build_model_stack(config: dict, device: torch.device):
             amp_head_mlp_ratio=config.get("amp_head_mlp_ratio", 4.0),
             amp_head_attn_dropout=config.get("amp_head_attn_dropout", 0.0),
             amp_head_use_rmsf_prior=config.get("amp_head_use_rmsf_prior", False),
-        ),
-        "v12c": SpectralConvBlockMixAmplitudeRefinedConfig(
-            in_channels=total_channels, cond_channels=coord_channels,
-            depth=config.get("num_layers", 12), num_heads=config.get("num_heads", 8),
-            top_k_freqs=top_k_freqs, freq_hidden_size=config.get("freq_hidden_size", 12),
-            spectral_modes=config.get("spectral_modes", top_k_freqs),
-            prediction_target=config.get("prediction_target", "x_0"),
-            freq_scale=freq_scales_for_model, cfg_dropout=config.get("conditioning_dropout", False), is_dct=use_dct,
-            conditioned_freq_scale=conditioned_freq_scale_for_model,
-            use_hilbert=config.get("use_hilbert_spatial", False),
-            use_hilbert_dct=config.get("use_hilbert_spatial_dct", False),
-            hilbert_mode=config.get("hilbert_mode", "input_only"),
-            use_rmsf_prior_gain=config.get("use_rmsf_prior_gain", False),
-            use_low_k_correction_head=config.get("use_low_k_correction_head", False),
-            low_k_correction_modes=config.get("low_k_correction_modes", None),
-            use_seq_conditioning=config.get("use_seq_conditioning", False),
-            seq_embed_dim=config.get("seq_embed_dim", 16),
-            use_ss_conditioning=config.get("use_ss_conditioning", False),
-            ss_embed_dim=config.get("ss_embed_dim", 8),
-            band_edges=config.get("fast_band_edges", None),
-            amp_head_context_modes=config.get("amp_head_context_modes", 4),
-            amp_head_target_modes=config.get("amp_head_target_modes", 1),
-            amp_head_d_model=config.get("amp_head_d_model", 128),
-            amp_head_depth=config.get("amp_head_depth", 3),
-            amp_head_num_heads=config.get("amp_head_num_heads", 4),
-            amp_head_mlp_ratio=config.get("amp_head_mlp_ratio", 4.0),
-            amp_head_attn_dropout=config.get("amp_head_attn_dropout", 0.0),
-            amp_head_use_rmsf_prior=config.get("amp_head_use_rmsf_prior", False),
-            use_shake=config.get("use_shake", True),
+            use_shake=config.get("use_shake", False),
             shake_n_iter=config.get("shake_n_iter", 20),
             shake_target=config.get("shake_target", 3.8),
-            refiner_hidden=config.get("refiner_hidden", 32),
-            refiner_depth=config.get("refiner_depth", 2),
-            refiner_kernel_size=config.get("refiner_kernel_size", 5),
-            refiner_max_delta=config.get("refiner_max_delta", 0.5),
-        ),
-        "v17a": SpectralConvBlockMixAmplitudeSpectralGraphRefinedConfig(
-            in_channels=total_channels, cond_channels=coord_channels,
-            depth=config.get("num_layers", 12), num_heads=config.get("num_heads", 8),
-            top_k_freqs=top_k_freqs, freq_hidden_size=config.get("freq_hidden_size", 12),
-            spectral_modes=config.get("spectral_modes", top_k_freqs),
-            prediction_target=config.get("prediction_target", "x_0"),
-            freq_scale=freq_scales_for_model, cfg_dropout=config.get("conditioning_dropout", False), is_dct=use_dct,
-            conditioned_freq_scale=conditioned_freq_scale_for_model,
-            use_hilbert=config.get("use_hilbert_spatial", False),
-            use_hilbert_dct=config.get("use_hilbert_spatial_dct", False),
-            hilbert_mode=config.get("hilbert_mode", "input_only"),
-            use_rmsf_prior_gain=config.get("use_rmsf_prior_gain", False),
-            use_low_k_correction_head=config.get("use_low_k_correction_head", False),
-            low_k_correction_modes=config.get("low_k_correction_modes", None),
-            use_seq_conditioning=config.get("use_seq_conditioning", False),
-            seq_embed_dim=config.get("seq_embed_dim", 16),
-            use_ss_conditioning=config.get("use_ss_conditioning", False),
-            ss_embed_dim=config.get("ss_embed_dim", 8),
-            band_edges=config.get("fast_band_edges", None),
-            amp_head_context_modes=config.get("amp_head_context_modes", 4),
-            amp_head_target_modes=config.get("amp_head_target_modes", 1),
-            amp_head_d_model=config.get("amp_head_d_model", 128),
-            amp_head_depth=config.get("amp_head_depth", 3),
-            amp_head_num_heads=config.get("amp_head_num_heads", 4),
-            amp_head_mlp_ratio=config.get("amp_head_mlp_ratio", 4.0),
-            amp_head_attn_dropout=config.get("amp_head_attn_dropout", 0.0),
-            amp_head_use_rmsf_prior=config.get("amp_head_use_rmsf_prior", False),
-            use_shake=config.get("use_shake", True),
-            shake_n_iter=config.get("shake_n_iter", 20),
-            shake_target=config.get("shake_target", 3.8),
-            refiner_hidden=config.get("refiner_hidden", 32),
-            refiner_depth=config.get("refiner_depth", 2),
-            refiner_kernel_size=config.get("refiner_kernel_size", 5),
-            refiner_max_delta=config.get("refiner_max_delta", 0.5),
-            use_spectral_graph_refiner=config.get("use_spectral_graph_refiner", True),
-            spectral_graph_refiner_modes=config.get("spectral_graph_refiner_modes", 17),
-            spectral_graph_refiner_hidden=config.get("spectral_graph_refiner_hidden", 128),
-            spectral_graph_refiner_depth=config.get("spectral_graph_refiner_depth", 3),
-            spectral_graph_refiner_msg_hidden=config.get("spectral_graph_refiner_msg_hidden", None),
-            spectral_graph_refiner_sequence_window=config.get("spectral_graph_refiner_sequence_window", 2),
-            spectral_graph_refiner_knn=config.get("spectral_graph_refiner_knn", 16),
-            spectral_graph_refiner_use_sequence_edges=config.get("spectral_graph_refiner_use_sequence_edges", True),
-            spectral_graph_refiner_use_native_knn=config.get("spectral_graph_refiner_use_native_knn", True),
-            spectral_graph_refiner_max_delta=config.get("spectral_graph_refiner_max_delta", 0.25),
-        ),
-        "v17b": SpectralConvBlockMixAmplitudeBondGraphRefinedConfig(
-            in_channels=total_channels, cond_channels=coord_channels,
-            depth=config.get("num_layers", 12), num_heads=config.get("num_heads", 8),
-            top_k_freqs=top_k_freqs, freq_hidden_size=config.get("freq_hidden_size", 12),
-            spectral_modes=config.get("spectral_modes", top_k_freqs),
-            prediction_target=config.get("prediction_target", "x_0"),
-            freq_scale=freq_scales_for_model, cfg_dropout=config.get("conditioning_dropout", False), is_dct=use_dct,
-            conditioned_freq_scale=conditioned_freq_scale_for_model,
-            use_hilbert=config.get("use_hilbert_spatial", False),
-            use_hilbert_dct=config.get("use_hilbert_spatial_dct", False),
-            hilbert_mode=config.get("hilbert_mode", "input_only"),
-            use_rmsf_prior_gain=config.get("use_rmsf_prior_gain", False),
-            use_low_k_correction_head=config.get("use_low_k_correction_head", False),
-            low_k_correction_modes=config.get("low_k_correction_modes", None),
-            use_seq_conditioning=config.get("use_seq_conditioning", False),
-            seq_embed_dim=config.get("seq_embed_dim", 16),
-            use_ss_conditioning=config.get("use_ss_conditioning", False),
-            ss_embed_dim=config.get("ss_embed_dim", 8),
-            band_edges=config.get("fast_band_edges", None),
-            amp_head_context_modes=config.get("amp_head_context_modes", 4),
-            amp_head_target_modes=config.get("amp_head_target_modes", 1),
-            amp_head_d_model=config.get("amp_head_d_model", 128),
-            amp_head_depth=config.get("amp_head_depth", 3),
-            amp_head_num_heads=config.get("amp_head_num_heads", 4),
-            amp_head_mlp_ratio=config.get("amp_head_mlp_ratio", 4.0),
-            amp_head_attn_dropout=config.get("amp_head_attn_dropout", 0.0),
-            amp_head_use_rmsf_prior=config.get("amp_head_use_rmsf_prior", False),
-            use_shake=config.get("use_shake", True),
-            shake_n_iter=config.get("shake_n_iter", 20),
-            shake_target=config.get("shake_target", 3.8),
-            refiner_hidden=config.get("refiner_hidden", 32),
-            refiner_depth=config.get("refiner_depth", 2),
-            refiner_kernel_size=config.get("refiner_kernel_size", 5),
-            refiner_max_delta=config.get("refiner_max_delta", 0.5),
-            use_bond_spectral_graph_refiner=config.get("use_bond_spectral_graph_refiner", True),
-            bond_spectral_graph_refiner_modes=config.get("bond_spectral_graph_refiner_modes", 17),
-            bond_spectral_graph_refiner_hidden=config.get("bond_spectral_graph_refiner_hidden", 128),
-            bond_spectral_graph_refiner_depth=config.get("bond_spectral_graph_refiner_depth", 3),
-            bond_spectral_graph_refiner_msg_hidden=config.get("bond_spectral_graph_refiner_msg_hidden", None),
-            bond_spectral_graph_refiner_sequence_window=config.get("bond_spectral_graph_refiner_sequence_window", 2),
-            bond_spectral_graph_refiner_knn=config.get("bond_spectral_graph_refiner_knn", 16),
-            bond_spectral_graph_refiner_use_sequence_edges=config.get("bond_spectral_graph_refiner_use_sequence_edges", True),
-            bond_spectral_graph_refiner_use_native_knn=config.get("bond_spectral_graph_refiner_use_native_knn", True),
-            bond_spectral_graph_refiner_max_delta=config.get("bond_spectral_graph_refiner_max_delta", 0.25),
-            bond_spectral_graph_refiner_blend=config.get("bond_spectral_graph_refiner_blend", 1.0),
-        ),
-        "v12a_egnn": SpectralConvBlockMixAmplitudeEGNNConfig(
-            in_channels=total_channels, cond_channels=coord_channels,
-            depth=config.get("num_layers", 12), num_heads=config.get("num_heads", 8),
-            top_k_freqs=top_k_freqs, freq_hidden_size=config.get("freq_hidden_size", 12),
-            spectral_modes=config.get("spectral_modes", top_k_freqs),
-            prediction_target=config.get("prediction_target", "x_0"),
-            freq_scale=freq_scales_for_model, cfg_dropout=config.get("conditioning_dropout", False), is_dct=use_dct,
-            conditioned_freq_scale=conditioned_freq_scale_for_model,
-            use_hilbert=config.get("use_hilbert_spatial", False),
-            use_hilbert_dct=config.get("use_hilbert_spatial_dct", False),
-            hilbert_mode=config.get("hilbert_mode", "input_only"),
-            use_rmsf_prior_gain=config.get("use_rmsf_prior_gain", False),
-            use_low_k_correction_head=config.get("use_low_k_correction_head", False),
-            low_k_correction_modes=config.get("low_k_correction_modes", None),
-            use_seq_conditioning=config.get("use_seq_conditioning", False),
-            seq_embed_dim=config.get("seq_embed_dim", 16),
-            use_ss_conditioning=config.get("use_ss_conditioning", False),
-            ss_embed_dim=config.get("ss_embed_dim", 8),
-            band_edges=config.get("fast_band_edges", None),
-            amp_head_context_modes=config.get("amp_head_context_modes", 4),
-            amp_head_target_modes=config.get("amp_head_target_modes", 1),
-            amp_head_d_model=config.get("amp_head_d_model", 128),
-            amp_head_depth=config.get("amp_head_depth", 3),
-            amp_head_num_heads=config.get("amp_head_num_heads", 4),
-            amp_head_mlp_ratio=config.get("amp_head_mlp_ratio", 4.0),
-            amp_head_attn_dropout=config.get("amp_head_attn_dropout", 0.0),
-            amp_head_use_rmsf_prior=config.get("amp_head_use_rmsf_prior", False),
-            use_shake=config.get("use_shake", True),
-            shake_n_iter=config.get("shake_n_iter", 20),
-            shake_target=config.get("shake_target", 3.8),
-            egnn_h_dim=config.get("egnn_h_dim", 32),
-            egnn_hidden=config.get("egnn_hidden", 64),
-            egnn_depth=config.get("egnn_depth", 3),
-            egnn_seq_window=config.get("egnn_seq_window", 12),
-            egnn_max_len=config.get("egnn_max_len", 1024),
-            egnn_t_chunk=config.get("egnn_t_chunk", 64),
-        ),
-        "spectral_conv_block_mix_slow_hybrid": SpectralConvBlockMixSlowHybridConfig(
-            in_channels=total_channels, cond_channels=coord_channels,
-            depth=config.get("num_layers", 12), num_heads=config.get("num_heads", 8),
-            top_k_freqs=top_k_freqs, freq_hidden_size=config.get("freq_hidden_size", 12),
-            spectral_modes=config.get("spectral_modes", top_k_freqs),
-            prediction_target=config.get("prediction_target", "x_0"),
-            freq_scale=freq_scales_for_model, cfg_dropout=config.get("conditioning_dropout", False), is_dct=use_dct,
-            conditioned_freq_scale=conditioned_freq_scale_for_model,
-            use_hilbert=config.get("use_hilbert_spatial", False),
-            use_hilbert_dct=config.get("use_hilbert_spatial_dct", False),
-            hilbert_mode=config.get("hilbert_mode", "input_only"),
-            use_rmsf_prior_gain=config.get("use_rmsf_prior_gain", False),
-            use_low_k_correction_head=config.get("use_low_k_correction_head", False),
-            low_k_correction_modes=config.get("low_k_correction_modes", None),
-            use_seq_conditioning=config.get("use_seq_conditioning", False),
-            seq_embed_dim=config.get("seq_embed_dim", 16),
-            use_ss_conditioning=config.get("use_ss_conditioning", False),
-            ss_embed_dim=config.get("ss_embed_dim", 8),
-            band_edges=config.get("fast_band_edges", None),
-            K_slow=config.get("K_slow", 4),
-            slow_mode_start=config.get("slow_mode_start", 0),
-            slow_d_model=config.get("slow_d_model", 192),
-            slow_depth=config.get("slow_depth", 6),
-            slow_num_heads=config.get("slow_num_heads", 4),
-            slow_mlp_ratio=config.get("slow_mlp_ratio", 4.0),
-            slow_attn_dropout=config.get("slow_attn_dropout", 0.0),
-            slow_use_rmsf_prior=config.get("slow_use_rmsf_prior", False),
-        ),
-        "v12b_egnn": SpectralConvBlockMixSlowHybridEGNNConfig(
-            in_channels=total_channels, cond_channels=coord_channels,
-            depth=config.get("num_layers", 12), num_heads=config.get("num_heads", 8),
-            top_k_freqs=top_k_freqs, freq_hidden_size=config.get("freq_hidden_size", 12),
-            spectral_modes=config.get("spectral_modes", top_k_freqs),
-            prediction_target=config.get("prediction_target", "x_0"),
-            freq_scale=freq_scales_for_model, cfg_dropout=config.get("conditioning_dropout", False), is_dct=use_dct,
-            conditioned_freq_scale=conditioned_freq_scale_for_model,
-            use_hilbert=config.get("use_hilbert_spatial", False),
-            use_hilbert_dct=config.get("use_hilbert_spatial_dct", False),
-            hilbert_mode=config.get("hilbert_mode", "input_only"),
-            use_rmsf_prior_gain=config.get("use_rmsf_prior_gain", False),
-            use_low_k_correction_head=config.get("use_low_k_correction_head", False),
-            low_k_correction_modes=config.get("low_k_correction_modes", None),
-            use_seq_conditioning=config.get("use_seq_conditioning", False),
-            seq_embed_dim=config.get("seq_embed_dim", 16),
-            use_ss_conditioning=config.get("use_ss_conditioning", False),
-            ss_embed_dim=config.get("ss_embed_dim", 8),
-            band_edges=config.get("fast_band_edges", None),
-            K_slow=config.get("K_slow", 4),
-            slow_mode_start=config.get("slow_mode_start", 0),
-            slow_d_model=config.get("slow_d_model", 192),
-            slow_depth=config.get("slow_depth", 6),
-            slow_num_heads=config.get("slow_num_heads", 4),
-            slow_mlp_ratio=config.get("slow_mlp_ratio", 4.0),
-            slow_attn_dropout=config.get("slow_attn_dropout", 0.0),
-            slow_use_rmsf_prior=config.get("slow_use_rmsf_prior", False),
-            use_shake=config.get("use_shake", True),
-            shake_n_iter=config.get("shake_n_iter", 20),
-            shake_target=config.get("shake_target", 3.8),
-            egnn_h_dim=config.get("egnn_h_dim", 32),
-            egnn_hidden=config.get("egnn_hidden", 64),
-            egnn_depth=config.get("egnn_depth", 3),
-            egnn_seq_window=config.get("egnn_seq_window", 12),
-            egnn_max_len=config.get("egnn_max_len", 1024),
-            egnn_t_chunk=config.get("egnn_t_chunk", 64),
-        ),
-        "dual_branch": DualBranchConfig(
-            in_channels=total_channels, cond_channels=coord_channels,
-            top_k_freqs=top_k_freqs,
-            prediction_target=config.get("prediction_target", "x_0"),
-            freq_scale=freq_scales_for_model, cfg_dropout=config.get("conditioning_dropout", False), is_dct=use_dct,
-            conditioned_freq_scale=conditioned_freq_scale_for_model,
-            use_seq_conditioning=config.get("use_seq_conditioning", False),
-            seq_embed_dim=config.get("seq_embed_dim", 16),
-            use_ss_conditioning=config.get("use_ss_conditioning", False),
-            ss_embed_dim=config.get("ss_embed_dim", 8),
-            K_slow=config.get("K_slow", 16),
-            slow_d_model=config.get("slow_d_model", 192),
-            slow_depth=config.get("slow_depth", 6),
-            slow_num_heads=config.get("slow_num_heads", 4),
-            slow_mlp_ratio=config.get("slow_mlp_ratio", 4.0),
-            slow_attn_dropout=config.get("slow_attn_dropout", 0.0),
-            slow_use_rmsf_prior=config.get("slow_use_rmsf_prior", False),
-            slow_predicts_amplitude_only=config.get("slow_predicts_amplitude_only", False),
-            fast_freq_hidden_size=config.get("freq_hidden_size", 12),
-            fast_depth=config.get("num_layers", 12),
-            fast_num_heads=config.get("num_heads", 8),
-            fast_spectral_modes=config.get("spectral_modes", top_k_freqs),
-            fast_cond_dim=config.get("fast_cond_dim", 512),
-            fast_use_hilbert=config.get("use_hilbert_spatial", False),
-            fast_use_hilbert_dct=config.get("use_hilbert_spatial_dct", False),
-            fast_hilbert_mode=config.get("hilbert_mode", "input_only"),
-            fast_use_rmsf_prior_gain=config.get("use_rmsf_prior_gain", False),
-            fast_band_edges=config.get("fast_band_edges", None),
-        ),
-    }
-    if model_type not in configs:
-        raise ValueError(f"Unknown model_type: {model_type}")
+        )
 
-    model = UnifiedWrapper(model_name=model_type, config=configs[model_type]).to(device)
+    model = UnifiedWrapper(model_name=model_type, config=model_config).to(device)
     load_model_weights(config["checkpoint_path"], model, device=device, log_fn=log)
     model.eval()
 
@@ -1891,9 +1711,10 @@ def build_model_stack(config: dict, device: torch.device):
     }
 
 
-# =============================================================================
+
 # Data loading (zarr + raw fallback), yielding per-(domain, temp) targets
 # =============================================================================
+
 def open_zarr_handle(zarr_path: str, label: str):
     import zarr
     try:
@@ -1907,13 +1728,11 @@ def open_zarr_handle(zarr_path: str, label: str):
         store = zarr.DirectoryStore(zarr_path)
         return {"root": None, "store": store}
 
-
 def open_zarr_group(handle, path: str):
     import zarr
     if handle["root"] is not None:
         return handle["root"][path]
     return zarr.open(store=handle["store"], path=path, mode="r")
-
 
 def top_level_group_keys(handle) -> list[str]:
     root = handle["root"]
@@ -1926,16 +1745,13 @@ def top_level_group_keys(handle) -> list[str]:
             names.add(parts[0])
     return sorted(names)
 
-
 def build_conditioning_coords(coords_type: str, native_bb: torch.Tensor) -> torch.Tensor:
     if coords_type == "bb":
         return native_bb.reshape(native_bb.shape[0], 12).contiguous()
     return native_bb[:, 1, :].contiguous()
 
-
 def ref_ca_from_bb_traj(bb_traj: torch.Tensor) -> torch.Tensor:
     return bb_traj[:, :, 1, :].contiguous()
-
 
 def pred_ca_from_output(pred_coords: torch.Tensor, coords_type: str) -> torch.Tensor:
     if coords_type == "bb":
@@ -1951,7 +1767,7 @@ def compute_gt_spectral_volumes_for_window(
     runtime: dict,
     device: torch.device,
 ) -> np.ndarray | None:
-    """Build GT DCT volumes for every available replicate in a matching window."""
+    '''Build GT DCT volumes for every available replicate in a matching window.'''
     window_size = int(runtime["window_size"])
     window_end = int(window_start) + window_size
     reps = [
@@ -1976,7 +1792,6 @@ def compute_gt_spectral_volumes_for_window(
         )
     return gt_flat.detach().float().cpu().numpy()
 
-
 def compute_spectral_volume_rows_for_prediction(
     sample: dict,
     pred_spectral_flat: np.ndarray,
@@ -1986,7 +1801,7 @@ def compute_spectral_volume_rows_for_prediction(
     config: dict,
     device: torch.device,
 ) -> list[dict]:
-    """Return bandwise spectral-volume rows for one generated window."""
+    '''Return bandwise spectral-volume rows for one generated window.'''
     if not bool(config.get("compute_spectral_volume_metrics", True)):
         return []
     if not bool(runtime.get("is_dct", True)) or bool(runtime.get("is_time_domain", False)):
@@ -2063,7 +1878,6 @@ def list_mdcath_targets_zarr(
                 targets.append((domain, temp, rep_ids))
     return handle, targets
 
-
 def list_atlas_domains_zarr(
     atlas_zarr_path: str, exclude_ids: set[str] | None = None
 ):
@@ -2080,12 +1894,11 @@ def list_atlas_domains_zarr(
             domains.append((domain, rep_ids))
     return handle, domains
 
-
 def load_mdcath_target_zarr(
     handle, domain_id: str, temp: str, coords_type: str, include_angles: bool,
     total_frames: int,
 ) -> dict:
-    """Return target dict with per-replicate full CA trajectories."""
+    '''Return target dict with per-replicate full CA trajectories.'''
     grp = open_zarr_group(handle, domain_id)
     rep_ids = sorted(grp[temp].group_keys())
     native_bb = torch.from_numpy(grp["native_bb_coords"][...]).float()
@@ -2125,7 +1938,6 @@ def load_mdcath_target_zarr(
         "replicate_ca": replicates,  # list of (total_frames, L, 3)
         "rep_ids": rep_ids,
     }
-
 
 def load_atlas_target_zarr(
     handle, domain_id: str, coords_type: str, include_angles: bool,
@@ -2171,9 +1983,9 @@ def load_atlas_target_zarr(
     }
 
 
-# =============================================================================
 # Batched inference
 # =============================================================================
+
 def infer_batch_eval(
     samples: list[dict],
     win_pos_values: torch.Tensor,
@@ -2182,15 +1994,14 @@ def infer_batch_eval(
     device: torch.device,
     dtype_ctx,
 ) -> list[dict]:
-    """Batch inference over B proteins in one GPU pass.
+    '''
+    Batch inference over B proteins in one GPU pass.
 
-    Args:
-        samples: list of sample dicts (native_coords, res_type, dssp, native_angles, temp).
-        win_pos_values: (B,) float32 tensor of win_pos fractions.
+    samples = list of sample dicts (native_coords, res_type, dssp, native_angles, temp).
+    win_pos_values = (B,) float32 tensor of win_pos fractions.
 
-    Returns:
-        list of dictionaries with CA coordinates and optional spectral-volume rows.
-    """
+    Returns list of dictionaries with CA coordinates and optional spectral-volume rows.
+    '''
     coords_type = config.get("coords_type", "ca")
     B = len(samples)
     coord_channels = runtime["coord_channels"]
@@ -2267,9 +2078,9 @@ def infer_batch_eval(
     return results
 
 
-# =============================================================================
 # Per-target metric computation (one comparison: pred vs gt ensemble)
 # =============================================================================
+
 def compute_metrics_for_comparison(
     pred_ca: np.ndarray,
     ref_ca_list: list[np.ndarray],
@@ -2281,12 +2092,13 @@ def compute_metrics_for_comparison(
     seed: int,
     include_spectral: bool,
 ) -> dict:
-    """Full metric panel for (single pred trajectory, pooled ref ensemble).
+    '''
+    Full metric panel for (single pred trajectory, pooled ref ensemble).
 
     - pred_ca: (T_pred, L, 3) – already raw (not yet aligned)
     - ref_ca_list: list of per-replicate (T_ref, L, 3)
     - anchor: (L, 3) first frame of first MD replicate (used for alignment)
-    """
+    '''
     rng = np.random.default_rng(np.uint32(seed))
 
     # Alignment: both pred and each ref replicate onto anchor
@@ -2501,10 +2313,10 @@ def compute_metrics_for_comparison(
     return results
 
 
-# =============================================================================
 # Per-target aggregation over 5 repeats + oracle
 # =============================================================================
 # Fields that are scalar metrics (present in every repeat dict under a plain key)
+
 _SCALAR_KEYS = [
     "rmsf_pred_mean", "rmsf_ref_mean", "per_target_rmsf_r", "per_target_rmsf_spearman",
     "pairwise_rmsd_pred_mean", "pairwise_rmsd_ref_mean", "pairwise_rmsd_jsd",
@@ -2551,7 +2363,7 @@ _SPEC_KEYS = [
 
 
 def _average_metric_repeats(per_repeat: list[dict], include_spectral: bool) -> dict:
-    """Average scalar metrics across repeats. Non-scalars are stored under _raw."""
+    '''Average scalar metrics across repeats. Non-scalars are stored under _raw.'''
     keys = list(_SCALAR_KEYS)
     if include_spectral:
         keys += _SPEC_KEYS
@@ -2566,7 +2378,7 @@ def _average_metric_repeats(per_repeat: list[dict], include_spectral: bool) -> d
 def compute_oracle_baseline(
     target: dict, anchor: np.ndarray, config: dict, hist_bins: int, include_spectral: bool,
 ) -> dict:
-    """Leave-one-out oracle: each replicate vs pooled others; average folds."""
+    '''Leave-one-out oracle: each replicate vs pooled others; average folds.'''
     native_ca = target["native_bb"][:, 1, :].float().cpu().numpy()
     reps = [r.float().cpu().numpy() for r in target["replicate_ca"]]
     n_reps = len(reps)
@@ -2605,14 +2417,14 @@ def evaluate_from_trajectories(
     config: dict,
     inference_sec: float = 0.0,
 ) -> dict:
-    """Compute all metrics for one protein given pre-generated trajectories.
+    '''
+    Compute all metrics for one protein given pre-generated trajectories.
 
-    Args:
-        sample: target dict (replicate_ca, native_bb, temp, dataset, …).
-        pred_trajectories: list of n_repeats (T_pred, L, 3) float32 numpy arrays.
-        config: run config.
-        inference_sec: total wall-clock seconds spent on inference (for logging).
-    """
+    sample = target dict (replicate_ca, native_bb, temp, dataset, …).
+    pred_trajectories = list of n_repeats (T_pred, L, 3) float32 numpy arrays.
+    config = run config.
+    inference_sec = total wall-clock seconds spent on inference (for logging).
+    '''
     include_spectral = bool(config.get("compute_spectral_metrics", True))
     hist_bins = int(config.get("hist_bins", 100))
     n_repeats = len(pred_trajectories)
@@ -2940,9 +2752,9 @@ def _strip_private(d: dict) -> dict:
     return {k: v for k, v in d.items() if not str(k).startswith("_")}
 
 
-# =============================================================================
 # Main
 # =============================================================================
+
 def main(config: dict):
     rank, local_rank, world_size, is_distributed, device = init_process()
     seed_everything(int(config.get("seed", 42)) + rank)
@@ -2972,7 +2784,8 @@ def main(config: dict):
     atlas_extra_exclude = read_id_set(config.get("atlas_exclude_ids_path"))
     atlas_exclude_ids = (exclude_ids or set()) | (atlas_extra_exclude or set()) or None
 
-    # --- Target Discovery (mdCATH & ATLAS) ------------------------------------
+    # Target Discovery (mdCATH & ATLAS) 
+    # ------------------------------------
     mdcath_targets, atlas_targets = [], []
     mdcath_handle, atlas_handle = None, None
 
@@ -3010,8 +2823,7 @@ def main(config: dict):
     local_targets = shard_items(all_targets, rank, world_size)
     log(f"Rank {rank} processing {len(local_targets)} targets.")
 
-    # ------------------------------------------------------------------
-    # Phase 1: Parallel load all samples into memory
+    # 1. Parallel load all samples into memory
     # ------------------------------------------------------------------
     def load_target(tup):
         source, domain_id, temp = tup
@@ -3032,8 +2844,7 @@ def main(config: dict):
 
     print(f"[rank {rank}] Loaded {len(all_samples)} samples.", flush=True)
 
-    # ------------------------------------------------------------------
-    # Phase 2: Batched inference over repeats
+    # 2. Batched inference over repeats
     # ------------------------------------------------------------------
     batch_size = int(config.get("batch_size", 1))
     n_repeats = int(config.get("n_repeats", 5))
@@ -3091,8 +2902,7 @@ def main(config: dict):
         flush=True,
     )
 
-    # ------------------------------------------------------------------
-    # Phase 3: Parallel compute metrics and I/O per protein
+    # 3. Parallel compute metrics and I/O per protein
     # ------------------------------------------------------------------
     per_target_results: list[dict] = []
     save_trajs = bool(config.get("save_trajectories", False))
@@ -3125,7 +2935,7 @@ def main(config: dict):
             if res is not None:
                 per_target_results.append(res)
 
-    # --- Gather across ranks --------------------------------------------------
+    # Gather across ranks
     gathered = [None for _ in range(world_size)] if is_distributed else [per_target_results]
     gathered_spectral_rows = [None for _ in range(world_size)] if is_distributed else [spectral_volume_rows]
     if is_distributed:
@@ -3140,7 +2950,7 @@ def main(config: dict):
             dist.destroy_process_group()
         return
 
-    # --- Summaries ------------------------------------------------------------
+    # Summaries 
     include_spec = bool(config.get("compute_spectral_metrics", True))
     summary = {
         "evaluation/run_name": config["run_name"],
@@ -3168,7 +2978,7 @@ def main(config: dict):
     summary.update(summarise_dataset([r for r in merged if r["dataset"] == "atlas"], "atlas", include_spec))
     summary.update(summarise_spectral_volume_rows(merged_spectral_rows))
 
-    # --- Write outputs --------------------------------------------------------
+    # Out
     ckpt_dir = config["checkpoint_dir"]
     _suffix = "_bond_normalised" if bool(config.get("normalize_caca_bonds", False)) else ""
     summary_path = os.path.join(ckpt_dir, f"evaluation_summary{_suffix}.json")
@@ -3242,11 +3052,11 @@ def main(config: dict):
     print("FINISHED EVALUATION")
 
 
-# =============================================================================
 # CLI
 # =============================================================================
+
 def parse_args() -> dict:
-    parser = argparse.ArgumentParser(description="Unified test-set evaluation for Pancake checkpoints.")
+    parser = argparse.ArgumentParser(description="Unified test-set evaluation for DynaMode checkpoints.")
     
     # Core
     parser.add_argument("--config", type=str, default=None)
@@ -3279,7 +3089,7 @@ def parse_args() -> dict:
         action="store_true",
         default=None,
         help="Store every adjacent CA-CA bond distance in evaluation_raw_distributions*.pt. "
-             "This is useful for bond histograms but can add several GB on full v12a runs.",
+             "This is useful for bond histograms but can add several GB on full SpecConv runs.",
     )
     parser.add_argument("--normalize_caca_bonds", action="store_true", default=None)
     parser.add_argument("--caca_bond_target", type=float, default=None)
@@ -3340,39 +3150,25 @@ def parse_args() -> dict:
         choices=["auto", "none", "freq_scales", "artifact"],
     )
     parser.add_argument("--use_DCT", action="store_true", default=None)
-    parser.add_argument("--model_type", type=str, default=None)
+    parser.add_argument("--model_type", type=str, default=None, choices=SUPPORTED_MODEL_TYPES)
     parser.add_argument("--top_k_freqs", type=int, default=None)
     parser.add_argument("--freq_hidden_size", type=int, default=None)
     parser.add_argument("--spectral_modes", type=int, default=None)
-    parser.add_argument("--hidden_size", type=int, default=None)
-    parser.add_argument("--jepa_latent_dim", type=int, default=None)
     parser.add_argument("--num_layers", type=int, default=None)
     parser.add_argument("--num_heads", type=int, default=None)
     parser.add_argument("--prediction_target", type=str, default=None)
-    parser.add_argument("--coord_scale", type=float, default=None)
-    parser.add_argument("--temporal_ablation_mode", type=str, default=None)
-    parser.add_argument("--block_ablation_mode", type=str, default=None)
-    parser.add_argument("--temporal_gate_init", type=float, default=None)
+    parser.add_argument("--cond_dim", type=int, default=None)
     parser.add_argument("--use_seq_conditioning", action="store_true", default=None)
     parser.add_argument("--seq_embed_dim", type=int, default=None)
     parser.add_argument("--use_ss_conditioning", action="store_true", default=None)
     parser.add_argument("--ss_embed_dim", type=int, default=None)
-    parser.add_argument("--K_slow", type=int, default=None)
-    parser.add_argument("--slow_mode_start", type=int, default=None)
-    parser.add_argument("--slow_d_model", type=int, default=None)
-    parser.add_argument("--slow_depth", type=int, default=None)
-    parser.add_argument("--slow_num_heads", type=int, default=None)
-    parser.add_argument("--slow_mlp_ratio", type=float, default=None)
-    parser.add_argument("--slow_attn_dropout", type=float, default=None)
-    parser.add_argument("--slow_use_rmsf_prior", action="store_true", default=None)
-    parser.add_argument("--slow_predicts_amplitude_only", action="store_true", default=None)
-    parser.add_argument("--fast_cond_dim", type=int, default=None)
     parser.add_argument("--use_hilbert_spatial", action="store_true", default=None)
     parser.add_argument("--use_hilbert_spatial_dct", action="store_true", default=None)
     parser.add_argument("--hilbert_mode", type=str, default=None)
     parser.add_argument("--use_rmsf_prior_gain", action="store_true", default=None)
     parser.add_argument("--use_low_k_correction_head", action="store_true", default=None)
     parser.add_argument("--low_k_correction_modes", type=str, default=None)
+    parser.add_argument("--band_edges", type=str, default=None)
     parser.add_argument("--amp_head_context_modes", type=int, default=None)
     parser.add_argument("--amp_head_target_modes", type=int, default=None)
     parser.add_argument("--amp_head_d_model", type=int, default=None)
@@ -3384,37 +3180,6 @@ def parse_args() -> dict:
     parser.add_argument("--use_shake", action="store_true", default=None)
     parser.add_argument("--shake_n_iter", type=int, default=None)
     parser.add_argument("--shake_target", type=float, default=None)
-    parser.add_argument("--refiner_hidden", type=int, default=None)
-    parser.add_argument("--refiner_depth", type=int, default=None)
-    parser.add_argument("--refiner_kernel_size", type=int, default=None)
-    parser.add_argument("--refiner_max_delta", type=float, default=None)
-    parser.add_argument("--use_spectral_graph_refiner", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--spectral_graph_refiner_modes", type=int, default=None)
-    parser.add_argument("--spectral_graph_refiner_hidden", type=int, default=None)
-    parser.add_argument("--spectral_graph_refiner_depth", type=int, default=None)
-    parser.add_argument("--spectral_graph_refiner_msg_hidden", type=int, default=None)
-    parser.add_argument("--spectral_graph_refiner_sequence_window", type=int, default=None)
-    parser.add_argument("--spectral_graph_refiner_knn", type=int, default=None)
-    parser.add_argument("--spectral_graph_refiner_use_sequence_edges", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--spectral_graph_refiner_use_native_knn", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--spectral_graph_refiner_max_delta", type=float, default=None)
-    parser.add_argument("--use_bond_spectral_graph_refiner", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--bond_spectral_graph_refiner_modes", type=int, default=None)
-    parser.add_argument("--bond_spectral_graph_refiner_hidden", type=int, default=None)
-    parser.add_argument("--bond_spectral_graph_refiner_depth", type=int, default=None)
-    parser.add_argument("--bond_spectral_graph_refiner_msg_hidden", type=int, default=None)
-    parser.add_argument("--bond_spectral_graph_refiner_sequence_window", type=int, default=None)
-    parser.add_argument("--bond_spectral_graph_refiner_knn", type=int, default=None)
-    parser.add_argument("--bond_spectral_graph_refiner_use_sequence_edges", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--bond_spectral_graph_refiner_use_native_knn", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--bond_spectral_graph_refiner_max_delta", type=float, default=None)
-    parser.add_argument("--bond_spectral_graph_refiner_blend", type=float, default=None)
-    parser.add_argument("--egnn_h_dim", type=int, default=None)
-    parser.add_argument("--egnn_hidden", type=int, default=None)
-    parser.add_argument("--egnn_depth", type=int, default=None)
-    parser.add_argument("--egnn_seq_window", type=int, default=None)
-    parser.add_argument("--egnn_max_len", type=int, default=None)
-    parser.add_argument("--egnn_t_chunk", type=int, default=None)
     parser.add_argument("--guidance_scale", type=float, default=None)
     parser.add_argument("--num_steps", type=int, default=None)
     parser.add_argument("--num_ode_steps", type=int, default=None)
@@ -3459,6 +3224,10 @@ def parse_args() -> dict:
     config["freq_normalization"] = canonical_freq_normalization(config.get("freq_normalization", "auto"))
     config["dc_residualization"] = canonical_dc_residualization(config.get("dc_residualization", "auto"))
     config["aniso_source"] = canonical_aniso_source(config.get("aniso_source", "auto"))
+    config.setdefault("model_type", "spectral_dit_low_k")
+    if config["model_type"] not in SUPPORTED_MODEL_TYPES:
+        supported = ", ".join(SUPPORTED_MODEL_TYPES)
+        raise ValueError(f"model_type must be one of: {supported}")
     config.setdefault("use_zarr", True)
     config.setdefault("n_repeats", 5)
     config.setdefault("pairwise_rmsd_samples", 10000)
