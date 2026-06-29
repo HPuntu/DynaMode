@@ -26,3 +26,5 @@ src/dynamode/eval/summarise.py
 *.pt
 *.pth
 *.zarr/
+
+update_public.txt
