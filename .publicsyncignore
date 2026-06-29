@@ -16,6 +16,7 @@ splits/
 logs/
 wandb/
 TODO.md
+src/dynamode/eval/summarise.py
 
 # Large or private artifacts
 *.ckpt
