@@ -1,0 +1,14 @@
+name: dynamode
+
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.10
+  - pip
+  - setuptools>=68
+  - wheel
+
+  # Installs DynaMode in editable mode plus evaluation extras.
+  - pip:
+      - -e .[eval]

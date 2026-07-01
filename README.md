@@ -12,10 +12,15 @@ Official implementation of [**DynaMode** (Spectral Diffusion for Protein Dynamic
 
 ## Installation
 
+From the repository root, create the conda environment:
+
 ```bash
 conda env create -f dynamode.yaml
 conda activate dynamode
 ```
+
+The environment installs DynaMode in editable mode with evaluation extras (`-e .[eval]`).
+Or just run `pip install -e`.
 
 ## Datasets
 
