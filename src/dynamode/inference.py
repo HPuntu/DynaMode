@@ -1,14 +1,12 @@
-"""Unified Pancake inference interface.
+"""Unified DynaMode inference interface.
 
-This module is deliberately library-first.  It reuses the model/runtime builder
-from ``src.evaluation2`` and the sampler from ``src.train`` so standalone
-inference, notebooks, validation, and evaluation all pass through the same
-runtime contracts.
+This module is deliberately library-first. It owns the public sampling path used
+by standalone inference, notebooks, training validation/test passes, and
+evaluation.
 """
 
 from __future__ import annotations
 
-import argparse
 import contextlib
 import glob
 import math
@@ -20,8 +18,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
+import hydra
 import numpy as np
 import torch
+from omegaconf import DictConfig, OmegaConf
 
 REPO = Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
@@ -32,26 +32,204 @@ try:
 except ModuleNotFoundError:  # Keep the module importable in minimal test envs.
     md = None
 
-from src.minimiser import minimise_ca
+from dynamode.minimiser import minimise_ca
+from dynamode.model.stack import build_model_stack
+from dynamode.model.shake import shake_caca
+from dynamode.model.wrapper import CFGModelWrapper
+from dynamode.spectral.representation import CoordinateRepresentation
 
 
-def _evaluation2():
-    from src import evaluation2
+def _evaluation():
+    from dynamode.eval import evaluation
 
-    return evaluation2
+    return evaluation
 
 
 def _features():
-    from src.features import features
+    from dynamode.dataloader import features
 
     return features
 
 
-def run_inference(*args: Any, **kwargs: Any):
-    """Lazy re-export of ``src.train.run_inference`` for compatibility."""
-    from src.train import run_inference as _run_inference
+def maybe_restore_dc(
+    spectral_adapter: Any,
+    x: torch.Tensor,
+    dc_baseline: torch.Tensor | None,
+    coord_channels: int,
+) -> torch.Tensor:
+    if (
+        spectral_adapter is None
+        or x is None
+        or dc_baseline is None
+        or not hasattr(spectral_adapter, "restore_dc")
+    ):
+        return x
+    return spectral_adapter.restore_dc(x, dc_baseline, coord_channels=coord_channels)
 
-    return _run_inference(*args, **kwargs)
+
+def build_spectral_mask(
+    mask: torch.Tensor,
+    torsion_mask: torch.Tensor | None,
+    top_k: int,
+    is_dct: bool,
+    *,
+    coord_channels: int = 3,
+    representation: CoordinateRepresentation | None = None,
+) -> torch.Tensor:
+    """Build the flattened spectral mask used by the sampler and validation."""
+    if representation is not None:
+        return representation.spectral_mask(mask, torsion_mask, top_k, is_dct)
+    mask_coords = mask.unsqueeze(-1).expand(-1, -1, coord_channels)
+    if torsion_mask is not None:
+        feature_mask = torch.cat([mask_coords, torsion_mask], dim=-1)
+    else:
+        feature_mask = mask_coords
+
+    if is_dct:
+        full = feature_mask.unsqueeze(2).expand(-1, -1, top_k, -1)
+        return full.reshape(feature_mask.shape[0], feature_mask.shape[1], -1)
+    full = feature_mask.unsqueeze(2).unsqueeze(-1).expand(-1, -1, top_k, -1, 2)
+    return full.reshape(feature_mask.shape[0], feature_mask.shape[1], -1)
+
+
+def run_inference(
+    model: torch.nn.Module,
+    diffusion: Any,
+    transform_engine: Any,
+    shape: tuple[int, int, int],
+    native_coords: torch.Tensor,
+    native_angles: torch.Tensor | None,
+    temps: torch.Tensor,
+    window_size: int,
+    mask: torch.Tensor | None = None,
+    torsion_mask: torch.Tensor | None = None,
+    device: torch.device | str = "cpu",
+    guidance_scale: float = 1.0,
+    num_ode_steps: int = 20,
+    displacement: bool = True,
+    representation: CoordinateRepresentation | None = None,
+    win_pos: torch.Tensor | None = None,
+    rmsf_prior: torch.Tensor | None = None,
+    res_type: torch.Tensor | None = None,
+    dssp: torch.Tensor | None = None,
+    dc_baseline_per_res: torch.Tensor | None = None,
+) -> dict[str, torch.Tensor | None]:
+    """Sample a public spectral model and decode the result back to coordinates."""
+    model.eval()
+    real_model = model.module if hasattr(model, "module") else model
+    inner = getattr(real_model, "model", real_model)
+    is_dct = getattr(real_model, "is_dct", True)
+
+    needs_prior = getattr(inner, "use_rmsf_prior_gain", False)
+    if needs_prior and rmsf_prior is None:
+        raise ValueError(
+            "This model was configured to use an RMSF prior, but the batch did "
+            "not include rmsf_prior. Provide rmsf_prior_path or disable the prior."
+        )
+
+    coord_channels = native_coords.shape[-1]
+    representation = representation or CoordinateRepresentation(
+        displacement=displacement,
+        coord_channels=coord_channels,
+    )
+    repr_coord_channels = representation.model_coord_channels
+    angle_channels = native_angles.shape[-1] if native_angles is not None else 0
+    channels = repr_coord_channels + angle_channels
+
+    _batch_size, _length, feature_dim = shape
+    complex_mult = 1 if is_dct else 2
+    top_k = feature_dim // (channels * complex_mult)
+
+    if native_angles is not None:
+        if torsion_mask is None and mask is not None:
+            torsion_mask = mask.unsqueeze(-1).expand(-1, -1, angle_channels)
+        elif torsion_mask is not None and torsion_mask.dim() == 2:
+            torsion_mask = torsion_mask.unsqueeze(-1).expand(-1, -1, angle_channels)
+    else:
+        torsion_mask = None
+
+    input_noise = diffusion.sample_initial_noise(shape, device=device)
+    spec_mask = None
+    if mask is not None:
+        spec_mask = build_spectral_mask(
+            mask,
+            torsion_mask,
+            top_k,
+            is_dct,
+            coord_channels=repr_coord_channels,
+            representation=representation,
+        )
+        input_noise = input_noise * spec_mask
+
+    norm_temps = torch.clamp((temps - 250.0) / 200.0, 0.0, 1.0)
+    cfg_model = CFGModelWrapper(real_model, guidance_scale=guidance_scale)
+    x_t = diffusion.denoise_ode(
+        cfg_model,
+        input_noise,
+        native_coords,
+        native_angles,
+        norm_temps,
+        mask,
+        torsion_mask=torsion_mask,
+        is_dct=is_dct,
+        num_steps=num_ode_steps,
+        win_pos=win_pos,
+        rmsf_prior=rmsf_prior,
+        res_type=res_type,
+        dssp=dssp,
+        feature_dim=None,
+        spectral_mask=spec_mask,
+    )
+
+    dc_baseline = None
+    if dc_baseline_per_res is not None:
+        dc_baseline = dc_baseline_per_res.to(
+            device=x_t.device,
+            dtype=x_t.dtype,
+        )[..., :repr_coord_channels]
+    if hasattr(transform_engine, "lookup_dc_baselines") and dc_baseline is None:
+        dc_baseline = transform_engine.lookup_dc_baselines(
+            temps,
+            mask,
+            coord_channels=repr_coord_channels,
+            device=x_t.device,
+        )
+    x_t = maybe_restore_dc(transform_engine, x_t, dc_baseline, repr_coord_channels)
+
+    x_time = transform_engine.spectral_to_time(
+        x_t,
+        n_time_steps=window_size,
+        n_channels=channels,
+    )
+    if mask is not None:
+        x_time = x_time * mask.unsqueeze(1).unsqueeze(-1)
+    coord_repr_time = x_time[..., :repr_coord_channels]
+    coords_abs = representation.inverse(coord_repr_time, native_coords, mask=mask)
+
+    if getattr(inner, "use_shake", False):
+        if coords_abs.shape[-1] == 3:
+            coords_abs = shake_caca(
+                coords_abs,
+                mask=mask,
+                target=getattr(inner, "shake_target", 3.8),
+                n_iter=getattr(inner, "shake_n_iter", 20),
+            )
+        elif coords_abs.shape[-1] == 12:
+            ca_shaken = shake_caca(
+                coords_abs[..., 3:6],
+                mask=mask,
+                target=getattr(inner, "shake_target", 3.8),
+                n_iter=getattr(inner, "shake_n_iter", 20),
+            )
+            coords_abs = coords_abs.clone()
+            coords_abs[..., 3:6] = ca_shaken
+
+    pred_dict: dict[str, torch.Tensor | None] = {"coords": coords_abs, "spectral": x_t}
+    if angle_channels > 0:
+        pred_dict["angles"] = x_time[..., repr_coord_channels:]
+        if torsion_mask is not None:
+            pred_dict["angles"] = pred_dict["angles"] * torsion_mask.unsqueeze(1)
+    return pred_dict
 
 
 def seed_everything(seed: int) -> None:
@@ -105,7 +283,7 @@ def create_protein_torsion_mask(batch_size: int, seq_len: int, device: torch.dev
 
 def _require_mdtraj():
     if md is None:
-        raise ModuleNotFoundError("mdtraj is required for PDB loading/export in src.inference.")
+        raise ModuleNotFoundError("mdtraj is required for PDB loading/export in dynamode.inference.")
     return md
 
 
@@ -147,24 +325,24 @@ def load_inference_config(
     checkpoint_path: str | None = None,
     overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Load and normalise an inference config using evaluation2 conventions."""
-    evaluation2 = _evaluation2()
+    """Load and normalise an inference config using public evaluation conventions."""
+    evaluation = _evaluation()
     config: dict[str, Any] = {}
     if config_path:
-        config.update(evaluation2.flatten_yaml_config(config_path))
+        config.update(evaluation.flatten_yaml_config(config_path))
     elif checkpoint_dir:
         candidate = Path(checkpoint_dir) / "run_config.yaml"
         if candidate.exists():
-            config.update(evaluation2.flatten_yaml_config(str(candidate)))
+            config.update(evaluation.flatten_yaml_config(str(candidate)))
 
-    config = evaluation2.coerce_config_types(config)
+    config = evaluation.coerce_config_types(config)
     if checkpoint_dir is not None:
         config["checkpoint_dir"] = str(checkpoint_dir)
     if checkpoint_path is not None:
         config["checkpoint_path"] = str(checkpoint_path)
     if overrides:
         config.update({k: v for k, v in overrides.items() if v is not None})
-    config = evaluation2.coerce_config_types(config)
+    config = evaluation.coerce_config_types(config)
 
     if not config.get("checkpoint_path") and config.get("checkpoint_dir"):
         candidate = Path(config["checkpoint_dir"]) / "best_model.pt"
@@ -188,11 +366,11 @@ def load_inference_config(
 
     if config.get("representation") is None:
         config["representation"] = "displacement" if bool(config.get("displacement", True)) else "raw_coords"
-    config["representation"] = evaluation2.canonical_representation(config["representation"])
+    config["representation"] = evaluation.canonical_representation(config["representation"])
     config["displacement"] = config["representation"] == "displacement"
-    config["freq_normalization"] = evaluation2.canonical_freq_normalization(config.get("freq_normalization", "auto"))
-    config["dc_residualization"] = evaluation2.canonical_dc_residualization(config.get("dc_residualization", "auto"))
-    config["aniso_source"] = evaluation2.canonical_aniso_source(config.get("aniso_source", "auto"))
+    config["freq_normalization"] = evaluation.canonical_freq_normalization(config.get("freq_normalization", "auto"))
+    config["dc_residualization"] = evaluation.canonical_dc_residualization(config.get("dc_residualization", "auto"))
+    config["aniso_source"] = evaluation.canonical_aniso_source(config.get("aniso_source", "auto"))
     return config
 
 
@@ -289,7 +467,12 @@ class Inference:
 
         self.config = config
         self.device = select_device(cpu=cpu, device=str(device) if device is not None else None, device_index=device_index)
-        self.runtime = _evaluation2().build_model_stack(self.config, self.device)
+        self.runtime = build_model_stack(
+            self.config,
+            self.device,
+            load_weights_path=self.config["checkpoint_path"],
+            set_eval=True,
+        )
         self.dtype_ctx = (
             torch.autocast(device_type="cuda", dtype=torch.bfloat16)
             if self.device.type == "cuda" and torch.cuda.is_bf16_supported() and not no_amp
@@ -673,83 +856,93 @@ def export_trajectory(coords: torch.Tensor, topology: Any, output_prefix: str = 
     traj.save_xtc(str(prefix.with_suffix(".xtc")))
 
 
-def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run Pancake inference from PDB input(s).")
-    parser.add_argument("-f", "--input", required=True, help="PDB file, directory, or glob.")
-    parser.add_argument("--outdir", required=True)
-    parser.add_argument("--config", default=None)
-    parser.add_argument("--checkpoint_dir", default=None)
-    parser.add_argument("--checkpoint_path", default=None)
-    parser.add_argument("-t", "--temperature", type=float, default=None)
-    parser.add_argument("--frames", type=int, default=None, help="Generated frames to keep. One frame is treated as 1 ns for --ns.")
-    parser.add_argument("--ns", type=int, default=None, help="Alias for --frames, e.g. 750 gives three 256-frame windows trimmed to 750.")
-    parser.add_argument("--num_windows", type=int, default=None)
-    parser.add_argument("--chain", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--batch_size", type=int, default=None)
-    parser.add_argument("--crop_size", type=int, default=None)
-    parser.add_argument("--coords_type", choices=["ca", "bb"], default=None)
-    parser.add_argument("--include_angles", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--num_ode_steps", type=int, default=None)
-    parser.add_argument("--guidance_scale", type=float, default=None)
-    parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--device", default=None)
-    parser.add_argument("--device_index", type=int, default=0)
-    parser.add_argument("--cpu", action="store_true")
-    parser.add_argument("--no_amp", action="store_true")
-    parser.add_argument("--post_minimise", "--post_minimize", action="store_true")
-    parser.add_argument("--minimise_stage", "--minimize_stage", choices=["window", "trajectory"], default="trajectory")
-    parser.add_argument("--minimise_batch_size", "--minimize_batch_size", type=int, default=None)
-    parser.add_argument("--minimise_params_fp", "--minimize_params_fp", default=None)
-    parser.add_argument("--minimise_verbose", "--minimize_verbose", type=int, default=None)
-    parser.add_argument("--no_export", action="store_true")
-    parser.add_argument("--no_align_export", action="store_true")
-    return parser
+INFERENCE_RUNTIME_KEYS = {
+    "batch_size",
+    "crop_size",
+    "coords_type",
+    "include_angles",
+    "num_ode_steps",
+    "guidance_scale",
+}
 
 
-def main(argv: list[str] | None = None) -> None:
-    args = build_arg_parser().parse_args(argv)
-    overrides = {
-        key: value for key, value in vars(args).items()
-        if value is not None and key not in {
-            "input", "outdir", "config", "checkpoint_dir", "checkpoint_path",
-            "frames", "ns", "num_windows", "chain", "seed", "device",
-            "device_index", "cpu", "no_amp", "post_minimise", "minimise_stage",
-            "minimise_batch_size", "minimise_params_fp", "minimise_verbose", "no_export",
-            "no_align_export",
-        }
-    }
+def flatten_hydra_config(cfg: DictConfig | dict) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Split a Hydra config into model/runtime config and inference controls."""
+    raw = OmegaConf.to_container(cfg, resolve=True) if isinstance(cfg, DictConfig) else dict(cfg)
+    raw = raw or {}
+    inference_cfg = dict(raw.get("inference") or {})
+    model_config: dict[str, Any] = {}
+    for key, value in raw.items():
+        if key in {"hydra", "inference"}:
+            continue
+        if isinstance(value, dict):
+            model_config.update(value)
+        else:
+            model_config[key] = value
+
+    for key in INFERENCE_RUNTIME_KEYS:
+        value = inference_cfg.get(key)
+        if value is not None:
+            model_config[key] = value
+    return model_config, inference_cfg
+
+
+def _required_inference_path(value: str | None, key: str) -> str:
+    if value is None or str(value).strip() == "":
+        raise ValueError(f"Provide inference.{key}=... in the Hydra config or override.")
+    return str(value)
+
+
+@hydra.main(version_base=None, config_path="../../configs", config_name="spec_conv_displacement_ca_unit_var")
+def main(cfg: DictConfig) -> None:
+    """Hydra inference entrypoint.
+
+    Example:
+        python -m dynamode.inference inference.input=target.pdb inference.outdir=outputs
+    """
+    model_config, inference_cfg = flatten_hydra_config(cfg)
+    input_path = _required_inference_path(inference_cfg.get("input"), "input")
+    outdir = Path(_required_inference_path(inference_cfg.get("outdir"), "outdir"))
+
+    checkpoint_dir = inference_cfg.get("checkpoint_dir", model_config.get("checkpoint_dir"))
+    checkpoint_path = inference_cfg.get("checkpoint_path", model_config.get("checkpoint_path"))
+    if checkpoint_dir is not None:
+        model_config["checkpoint_dir"] = checkpoint_dir
+    if checkpoint_path is not None:
+        model_config["checkpoint_path"] = checkpoint_path
+
     runner = Inference(
-        config_path=args.config,
-        checkpoint_dir=args.checkpoint_dir,
-        checkpoint_path=args.checkpoint_path,
-        device=args.device,
-        device_index=args.device_index,
-        cpu=args.cpu,
-        no_amp=args.no_amp,
-        **overrides,
+        config=model_config,
+        checkpoint_dir=checkpoint_dir,
+        checkpoint_path=checkpoint_path,
+        device=inference_cfg.get("device"),
+        device_index=int(inference_cfg.get("device_index", 0) or 0),
+        cpu=bool(inference_cfg.get("cpu", False)),
+        no_amp=bool(inference_cfg.get("no_amp", False)),
     )
     start = time.perf_counter()
     results = runner.generate_from_pdb(
-        args.input,
-        temperature=args.temperature,
-        frames=args.frames,
-        ns=args.ns,
-        num_windows=args.num_windows,
-        chain=args.chain,
-        post_minimise=args.post_minimise,
-        minimise_stage=args.minimise_stage,
-        minimise_batch_size=args.minimise_batch_size,
-        minimise_params_fp=args.minimise_params_fp,
-        minimise_verbose=args.minimise_verbose,
-        seed=args.seed,
+        input_path,
+        temperature=inference_cfg.get("temperature"),
+        frames=inference_cfg.get("frames"),
+        ns=inference_cfg.get("ns"),
+        num_windows=inference_cfg.get("num_windows"),
+        chain=inference_cfg.get("chain"),
+        post_minimise=bool(inference_cfg.get("post_minimise", False)),
+        minimise_stage=str(inference_cfg.get("minimise_stage", "trajectory")),
+        minimise_batch_size=inference_cfg.get("minimise_batch_size"),
+        minimise_params_fp=inference_cfg.get("minimise_params_fp"),
+        minimise_verbose=inference_cfg.get("minimise_verbose"),
+        num_ode_steps=model_config.get("num_ode_steps"),
+        guidance_scale=model_config.get("guidance_scale"),
+        seed=inference_cfg.get("seed"),
     )
     elapsed = time.perf_counter() - start
-    outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
-    if not args.no_export:
+    if not bool(inference_cfg.get("no_export", False)):
         for result in results:
-            prefix = outdir / f"{result.name}_{int(result.sample.temp)}K_pancake"
-            result.save(prefix, align=not args.no_align_export)
+            prefix = outdir / f"{result.name}_{int(result.sample.temp)}K_dynamode"
+            result.save(prefix, align=not bool(inference_cfg.get("no_align_export", False)))
     print(
         f"Generated {sum(r.ca.shape[0] for r in results)} frames for {len(results)} target(s) "
         f"in {elapsed:.2f}s."
@@ -757,4 +950,4 @@ def main(argv: list[str] | None = None) -> None:
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    main()

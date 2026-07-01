@@ -16,19 +16,16 @@ def validate_batch(batch, required):
     if missing:
         raise KeyError(f"Missing batch keys: {missing}")
 
-
 def as_tensor(value, name):
     if not torch.is_tensor(value):
         raise TypeError(f"batch['{name}'] must be a torch.Tensor, got {type(value).__name__}")
     return value
-
 
 def check_1d(t, name, B=None):
     if t.ndim != 1:
         raise ValueError(f"batch['{name}'] must be 1D, got shape {tuple(t.shape)}")
     if B is not None and t.shape[0] != B:
         raise ValueError(f"batch['{name}'] must have shape ({B},), got {tuple(t.shape)}")
-
 
 def check_2d(t, name, B=None, L=None):
     if t.ndim != 2:
@@ -37,7 +34,6 @@ def check_2d(t, name, B=None, L=None):
         raise ValueError(f"batch['{name}'] first dim must be {B}, got {t.shape[0]}")
     if L is not None and t.shape[1] != L:
         raise ValueError(f"batch['{name}'] second dim must be {L}, got {t.shape[1]}")
-
 
 def check_3d(t, name, B=None, L=None, C=None):
     if t.ndim != 3:
@@ -48,7 +44,6 @@ def check_3d(t, name, B=None, L=None, C=None):
         raise ValueError(f"batch['{name}'] second dim must be {L}, got {t.shape[1]}")
     if C is not None and t.shape[2] != C:
         raise ValueError(f"batch['{name}'] last dim must be {C}, got {t.shape[2]}")
-
 
 def check_res_type(t, name, B, L):
     if t.ndim == 2:
@@ -64,7 +59,6 @@ def check_res_type(t, name, B, L):
     raise ValueError(
         f"batch['{name}'] must be residue indices (B, L) or one-hot (B, L, C), got {tuple(t.shape)}"
     )
-
 
 def check_residue_feature(t, name, B, L):
     if t.ndim == 2:

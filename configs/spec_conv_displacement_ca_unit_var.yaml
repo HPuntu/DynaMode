@@ -89,6 +89,35 @@ sampling:
   num_ode_steps: 50
   max_val_batches: 10
 
+inference:
+  input: null
+  outdir: outputs/inference
+  checkpoint_dir: null
+  checkpoint_path: null
+  temperature: null
+  frames: null
+  ns: null
+  num_windows: null
+  chain: null
+  batch_size: null
+  crop_size: null
+  coords_type: null
+  include_angles: null
+  num_ode_steps: null
+  guidance_scale: null
+  seed: null
+  device: null
+  device_index: 0
+  cpu: false
+  no_amp: false
+  post_minimise: false
+  minimise_stage: trajectory
+  minimise_batch_size: null
+  minimise_params_fp: null
+  minimise_verbose: null
+  no_export: false
+  no_align_export: false
+
 training:
   optimizer: adamw
   max_lr: 3.0e-5

@@ -6,7 +6,7 @@ core:
   top_k_freqs: 256
   epochs: 300
   checkpoint_dir: "/projects/u6ji/hew/pancake_checkpoints/spec_conv_displacement_ca_shake"
-  checkpoint_path: #"/projects/u6ji/hew/pancake_checkpoints/30.04.26_v12c_displacement_ca_BEST_small_shake/checkpoint_latest.pt"
+  checkpoint_path:
   use_DCT: true
   representation: "displacement"
   freq_normalization: "auto"
@@ -49,8 +49,6 @@ model:
   guidance_scale: 1.0
   num_ode_steps: 50
   max_val_batches: 10
-  bridge_scaling: "none"
-  coord_scale: null
   use_hilbert_spatial: false
   use_hilbert_spatial_dct: true
   hilbert_mode: "input_only"
@@ -82,13 +80,42 @@ diffusion:
   min_snr_gamma: null
   aniso_gamma: 0.5
 
+inference:
+  input: null
+  outdir: outputs/inference
+  checkpoint_dir: null
+  checkpoint_path: null
+  temperature: null
+  frames: null
+  ns: null
+  num_windows: null
+  chain: null
+  batch_size: null
+  crop_size: null
+  coords_type: null
+  include_angles: null
+  num_ode_steps: null
+  guidance_scale: null
+  seed: null
+  device: null
+  device_index: 0
+  cpu: false
+  no_amp: false
+  post_minimise: false
+  minimise_stage: trajectory
+  minimise_batch_size: null
+  minimise_params_fp: null
+  minimise_verbose: null
+  no_export: false
+  no_align_export: false
+
 training:
   optimizer: "adamw"
   max_lr: 3.0e-5
   freq_weighting: "exponential_decay"
   bending_lambda: 0.0
   # Comma-delimited options: idct_ca-ca, spec_geo, risk_band.
-  # Example: "idct_ca-ca,spec_geo" keeps the old loss and adds spectral topology.
+  # Example: "idct_ca-ca,spec_geo" combines local CA geometry and spectral topology.
   geo_loss: "spec_geo,risk_band"
   geometry_lambda: 1.0
   geometry_tol: 0.05
@@ -114,8 +141,3 @@ training:
   max_bad_update_total: 250
   ddp_find_unused_parameters: false
   ddp_static_graph: true
-
-deprecated:
-  smoothing: null
-  smoothing_sigma: 1.0
-  smooth_start_freq: 64

@@ -1,6 +1,5 @@
-# Original SpectralDiT transformer trunk with the v12-style additive low-k
-# correction head. This keeps the historical transformer architecture intact
-# while specializing the clean-spectrum x_0 prediction for DC and k=1..16.
+# SpectralDiT transformer baseline with the additive low-k correction head.
+# Clean-spectrum x_0 prediction is specialized for DC and k=1..16.
 
 core:
   run_name: "transformer_displacement_ca"
@@ -50,8 +49,6 @@ model:
   guidance_scale: 1.0
   num_ode_steps: 50
   max_val_batches: 10
-  bridge_scaling: "none"
-  coord_scale: null
   use_low_k_correction_head: true
   low_k_correction_modes: "DC,1-4,5-16"
 
@@ -61,6 +58,35 @@ diffusion:
   shift_value: 0.0
   min_snr_gamma: null
   aniso_gamma: 0.5
+
+inference:
+  input: null
+  outdir: outputs/inference
+  checkpoint_dir: null
+  checkpoint_path: null
+  temperature: null
+  frames: null
+  ns: null
+  num_windows: null
+  chain: null
+  batch_size: null
+  crop_size: null
+  coords_type: null
+  include_angles: null
+  num_ode_steps: null
+  guidance_scale: null
+  seed: null
+  device: null
+  device_index: 0
+  cpu: false
+  no_amp: false
+  post_minimise: false
+  minimise_stage: trajectory
+  minimise_batch_size: null
+  minimise_params_fp: null
+  minimise_verbose: null
+  no_export: false
+  no_align_export: false
 
 training:
   optimizer: "adamw"
@@ -84,8 +110,3 @@ training:
   dc_start_epoch: 10
   ddp_find_unused_parameters: false
   ddp_static_graph: true
-
-deprecated:
-  smoothing: null
-  smoothing_sigma: 1.0
-  smooth_start_freq: 64

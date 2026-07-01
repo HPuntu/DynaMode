@@ -158,6 +158,99 @@ MODEL_REGISTRY = {
 
 SUPPORTED_MODEL_TYPES = tuple(MODEL_REGISTRY)
 
+
+def _config_value(config: dict[str, Any], key: str, default: Any) -> Any:
+    value = config.get(key, default)
+    return default if value is None else value
+
+
+def make_model_config(
+    model_type: str,
+    *,
+    in_channels: int,
+    cond_channels: int,
+    top_k_freqs: int,
+    freq_scale: torch.Tensor | None = None,
+    conditioned_freq_scale: dict[str, Any] | None = None,
+    is_dct: bool = True,
+    **kwargs: Any,
+) -> BaseDiffusionConfig:
+    '''Create the public model config dataclass for a resolved runtime stack.'''
+    if model_type not in MODEL_REGISTRY:
+        supported = ", ".join(SUPPORTED_MODEL_TYPES)
+        raise ValueError(f"Unknown model_type={model_type!r}. Supported public models: {supported}")
+
+    depth = int(_config_value(kwargs, "num_layers", _config_value(kwargs, "depth", 12)))
+    num_heads = int(_config_value(kwargs, "num_heads", 8))
+    prediction_target = str(_config_value(kwargs, "prediction_target", "x_0"))
+    cfg_dropout = bool(_config_value(kwargs, "conditioning_dropout", _config_value(kwargs, "cfg_dropout", False)))
+
+    if model_type == "spectral_dit_low_k":
+        return SpectralDiTConfig(
+            in_channels=int(in_channels),
+            cond_channels=int(cond_channels),
+            depth=depth,
+            num_heads=num_heads,
+            top_k_freqs=int(top_k_freqs),
+            freq_hidden_size=int(_config_value(kwargs, "freq_hidden_size", 12)),
+            mlp_ratio=float(_config_value(kwargs, "mlp_ratio", 4.0)),
+            attn_dropout=float(_config_value(kwargs, "attn_dropout", 0.0)),
+            freq_scale=freq_scale,
+            conditioned_freq_scale=conditioned_freq_scale,
+            cfg_dropout=cfg_dropout,
+            prediction_target=prediction_target,
+            is_dct=bool(is_dct),
+            use_seq_conditioning=bool(_config_value(kwargs, "use_seq_conditioning", False)),
+            seq_embed_dim=int(_config_value(kwargs, "seq_embed_dim", 16)),
+            use_ss_conditioning=bool(_config_value(kwargs, "use_ss_conditioning", False)),
+            ss_embed_dim=int(_config_value(kwargs, "ss_embed_dim", 8)),
+            use_low_k_correction_head=True,
+            low_k_correction_modes=_config_value(kwargs, "low_k_correction_modes", 1),
+            cond_dim=int(_config_value(kwargs, "cond_dim", 512)),
+        )
+
+    spectral_modes = _config_value(kwargs, "spectral_modes", top_k_freqs)
+    band_edges = kwargs.get("band_edges", kwargs.get("fast_band_edges", None))
+    return SpectralConvBlockMixAmplitudeConfig(
+        in_channels=int(in_channels),
+        cond_channels=int(cond_channels),
+        depth=depth,
+        num_heads=num_heads,
+        top_k_freqs=int(top_k_freqs),
+        freq_hidden_size=int(_config_value(kwargs, "freq_hidden_size", 12)),
+        spectral_modes=int(top_k_freqs if spectral_modes is None else spectral_modes),
+        attn_dropout=float(_config_value(kwargs, "attn_dropout", 0.0)),
+        freq_scale=freq_scale,
+        conditioned_freq_scale=conditioned_freq_scale,
+        cfg_dropout=cfg_dropout,
+        prediction_target=prediction_target,
+        is_dct=bool(is_dct),
+        use_hilbert=bool(_config_value(kwargs, "use_hilbert_spatial", _config_value(kwargs, "use_hilbert", False))),
+        use_hilbert_dct=bool(_config_value(kwargs, "use_hilbert_spatial_dct", _config_value(kwargs, "use_hilbert_dct", False))),
+        hilbert_mode=str(_config_value(kwargs, "hilbert_mode", "every_block")),
+        use_rmsf_prior_gain=bool(_config_value(kwargs, "use_rmsf_prior_gain", False)),
+        use_low_k_correction_head=bool(_config_value(kwargs, "use_low_k_correction_head", False)),
+        low_k_correction_modes=_config_value(kwargs, "low_k_correction_modes", 1),
+        use_seq_conditioning=bool(_config_value(kwargs, "use_seq_conditioning", False)),
+        seq_embed_dim=int(_config_value(kwargs, "seq_embed_dim", 16)),
+        use_ss_conditioning=bool(_config_value(kwargs, "use_ss_conditioning", False)),
+        ss_embed_dim=int(_config_value(kwargs, "ss_embed_dim", 8)),
+        cond_dim=int(_config_value(kwargs, "cond_dim", 512)),
+        band_edges=band_edges,
+        amp_head_context_modes=int(_config_value(kwargs, "amp_head_context_modes", 4)),
+        amp_head_target_modes=int(_config_value(kwargs, "amp_head_target_modes", 1)),
+        amp_head_d_model=int(_config_value(kwargs, "amp_head_d_model", 128)),
+        amp_head_depth=int(_config_value(kwargs, "amp_head_depth", 3)),
+        amp_head_num_heads=int(_config_value(kwargs, "amp_head_num_heads", 4)),
+        amp_head_mlp_ratio=float(_config_value(kwargs, "amp_head_mlp_ratio", 4.0)),
+        amp_head_attn_dropout=float(_config_value(kwargs, "amp_head_attn_dropout", 0.0)),
+        amp_head_use_rmsf_prior=bool(_config_value(kwargs, "amp_head_use_rmsf_prior", False)),
+        use_shake=bool(_config_value(kwargs, "use_shake", False)),
+        shake_n_iter=int(_config_value(kwargs, "shake_n_iter", 20)),
+        shake_target=float(_config_value(kwargs, "shake_target", 3.8)),
+    )
+
+
 class UnifiedWrapper(nn.Module):
     def __init__(
         self,
@@ -242,4 +335,78 @@ class UnifiedWrapper(nn.Module):
             }
         out = self.model(**kwargs)
         return self._adapt_output(out)
-    
+
+
+class ClassifierFreeGuidanceWrapper(nn.Module):
+    '''Callable wrapper that applies classifier-free guidance at sampling time.
+
+    Diffusion samplers call this object with tensor arguments rather than the
+    batch dictionary accepted by :class:`UnifiedWrapper`. The wrapper converts
+    those arguments back into the public batch contract, optionally evaluates
+    both conditional and unconditional passes, and returns the guided model
+    prediction. It deliberately knows nothing about diffusion schedules or
+    coordinate decoding.
+    '''
+
+    def __init__(self, base_model: UnifiedWrapper, guidance_scale: float = 1.0):
+        super().__init__()
+        self.base_model = base_model
+        self.guidance_scale = float(guidance_scale)
+        self.prediction_target = getattr(base_model, "prediction_target", "noise")
+
+    def forward(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        norm_temps: torch.Tensor,
+        native_coords: torch.Tensor,
+        native_angles: torch.Tensor | None,
+        mask: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        if self.guidance_scale <= 1.0:
+            return self.base_model({
+                "x": x_t,
+                "t": t,
+                "temp": norm_temps,
+                "native_coords": native_coords,
+                "native_angles": native_angles,
+                "mask": mask,
+                "cond_drop_mask": None,
+                **kwargs,
+            })
+
+        batch_size = x_t.shape[0]
+        device = x_t.device
+        cond_drop_mask = torch.cat([
+            torch.zeros(batch_size, dtype=torch.bool, device=device),
+            torch.ones(batch_size, dtype=torch.bool, device=device),
+        ])
+        duplicated_kwargs = {
+            key: (
+                torch.cat([value, value], dim=0)
+                if torch.is_tensor(value)
+                else value
+            )
+            for key, value in kwargs.items()
+        }
+
+        out = self.base_model({
+            "x": torch.cat([x_t, x_t], dim=0),
+            "t": torch.cat([t, t], dim=0),
+            "temp": torch.cat([norm_temps, norm_temps], dim=0),
+            "native_coords": torch.cat([native_coords, native_coords], dim=0),
+            "native_angles": (
+                torch.cat([native_angles, native_angles], dim=0)
+                if native_angles is not None
+                else None
+            ),
+            "mask": torch.cat([mask, mask], dim=0) if mask is not None else None,
+            "cond_drop_mask": cond_drop_mask,
+            **duplicated_kwargs,
+        })
+        cond, uncond = torch.chunk(out, 2, dim=0)
+        return uncond + self.guidance_scale * (cond - uncond)
+
+
+CFGModelWrapper = ClassifierFreeGuidanceWrapper
