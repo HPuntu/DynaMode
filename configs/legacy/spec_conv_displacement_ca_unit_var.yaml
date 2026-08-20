@@ -8,6 +8,7 @@
 core:
   run_name: spec_conv_displacement_ca_unit_var
   checkpoint_dir: /projects/u6ji/hew/pancake_checkpoints/spec_conv_displacement_ca_unit_var
+  date_prefix_checkpoint_dir: true
   checkpoint_path: null
   resume_from_latest: false
   model_type: spectral_conv_block_mix_amplitude

@@ -25,12 +25,18 @@ from torch.utils.data import DataLoader, DistributedSampler, Subset
 from torch.nn.parallel import DistributedDataParallel as DDP
 from dotenv import load_dotenv
 import hydra
-from omegaconf import DictConfig, OmegaConf
-import yaml
+from hydra.core.hydra_config import HydraConfig
+from omegaconf import DictConfig
 import wandb
 
 load_dotenv()
 
+from dynamode.config import (
+    prepare_runtime_identity,
+    prepare_training_config,
+    update_model_spec,
+    write_run_metadata,
+)
 from dynamode.dataloader.zarr_loader import ZarrTrajectoriesDataset, FeaturizerWindowZarr
 from dynamode.dataloader.raw_loader import TrajectoriesDataset
 from dynamode.dataloader.features import FeaturizerWindow, Aligner
@@ -98,9 +104,20 @@ import torch.multiprocessing as mp
 mp.set_start_method('spawn', force=True)
 torch.multiprocessing.set_sharing_strategy('file_system')
 
-date_str = datetime.now().strftime("%d.%m.%y")
+def _synchronize_runtime_identity(config: dict, *, rank: int) -> dict:
+    """Let rank zero create the timestamped identity and broadcast it to DDP peers."""
 
-
+    payload: list[dict | None] = [None]
+    if rank == 0:
+        try:
+            payload[0] = {"config": prepare_runtime_identity(config)}
+        except Exception as exc:
+            payload[0] = {"error": f"{type(exc).__name__}: {exc}"}
+    dist.broadcast_object_list(payload, src=0)
+    result = payload[0] or {}
+    if result.get("error"):
+        raise RuntimeError(f"Could not create DynaMode run identity: {result['error']}")
+    return dict(result["config"])
 
 # HELPERS
 # -------
@@ -2043,8 +2060,45 @@ def TRAIN_DISTRIBUTED(
             pass
 
     if rank == 0:
-        n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"Model: {model_type} | Params: {n_params:,}")
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        inner_model = getattr(model, "model", model)
+        update_model_spec(
+            checkpoint_dir,
+            {
+                "model_class": f"{type(inner_model).__module__}.{type(inner_model).__name__}",
+                "wrapper_class": f"{type(model).__module__}.{type(model).__name__}",
+                "parameters": {
+                    "total": total_params,
+                    "trainable": trainable_params,
+                },
+                "resolved_model_config": stack.model_config,
+                "resolved_stack": {
+                    "coord_channels": stack.coord_channels,
+                    "representation_channels": stack.repr_coord_channels,
+                    "angle_channels": stack.angle_channels,
+                    "total_channels": stack.total_channels,
+                    "window_size": stack.window_size,
+                    "top_k_freqs": stack.top_k_freqs,
+                    "is_dct": stack.is_dct,
+                    "is_time_domain": stack.is_time_domain,
+                    "representation": stack.representation.name,
+                },
+                "resolved_spectral_policies": {
+                    "freq_normalization": transform_engine.effective_freq_normalization,
+                    "dc_residualization": transform_engine.effective_dc_residualization,
+                    "aniso_source": transform_engine.effective_aniso_source,
+                },
+                "resolved_noise": stack.resolved_noise,
+                "hardware": {
+                    "device": str(device),
+                    "cuda_device_name": torch.cuda.get_device_name(local_rank),
+                    "cuda_capability": list(torch.cuda.get_device_capability(local_rank)),
+                    "world_size": world_size,
+                },
+            },
+        )
+        print(f"Model: {model_type} | Params: {trainable_params:,} trainable / {total_params:,} total")
 
     if per_gpu_batch_size < 16:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
@@ -2262,140 +2316,6 @@ def maybe_rebuild_onecycle_scheduler(
 
 
 
-HYDRA_CONFIG_SKIP_SECTIONS = {"hydra", "inference"}
-TRAIN_FLOAT_KEYS = {
-    "max_lr",
-    "min_snr_gamma",
-    "shift_value",
-    "guidance_scale",
-    "bending_lambda",
-    "geometry_lambda",
-    "geometry_tol",
-    "clash_lambda",
-    "clash_threshold",
-    "spectral_geo_segment_threshold",
-    "aniso_gamma",
-    "rmsf_lambda",
-    "low_freq_lambda",
-    "dc_lambda",
-    "representation_length_min",
-    "representation_length_max",
-    "representation_length_residual_max",
-    "representation_barrier_lambda",
-    "amp_head_mlp_ratio",
-    "amp_head_attn_dropout",
-    "shake_target",
-}
-TRAIN_INT_KEYS = {
-    "epochs",
-    "batch_size",
-    "top_k_freqs",
-    "freq_hidden_size",
-    "spectral_modes",
-    "seq_embed_dim",
-    "ss_embed_dim",
-    "num_layers",
-    "num_heads",
-    "num_steps",
-    "num_ode_steps",
-    "max_val_batches",
-    "dataloader_num_workers",
-    "dataloader_timeout",
-    "dataloader_prefetch_factor",
-    "geometry_warmup_start",
-    "geometry_warmup_epochs",
-    "geometry_decay_start",
-    "geometry_decay_epochs",
-    "clash_max_pairs",
-    "clash_pair_chunk",
-    "spectral_geo_max_segment_pairs",
-    "risk_band_max_pairs",
-    "risk_band_max_segment_pairs",
-    "rmsf_warmup_start",
-    "rmsf_warmup_epochs",
-    "low_freq_modes",
-    "dc_start_epoch",
-    "amp_head_context_modes",
-    "amp_head_target_modes",
-    "amp_head_d_model",
-    "amp_head_depth",
-    "amp_head_num_heads",
-    "shake_n_iter",
-    "max_bad_update_streak",
-    "max_bad_update_total",
-}
-
-
-def flatten_hydra_config(cfg: DictConfig | dict, *, skip_sections=HYDRA_CONFIG_SKIP_SECTIONS) -> dict:
-    '''Flatten the public Hydra section layout into TRAIN_DISTRIBUTED kwargs.'''
-    raw = OmegaConf.to_container(cfg, resolve=True) if isinstance(cfg, DictConfig) else dict(cfg)
-    config: dict = {}
-    for key, value in (raw or {}).items():
-        if key in skip_sections:
-            continue
-        if isinstance(value, dict):
-            config.update(value)
-        else:
-            config[key] = value
-    return config
-
-
-def coerce_training_config_types(config: dict) -> dict:
-    '''Keep YAML/Hydra overrides aligned with the TRAIN_DISTRIBUTED signature.'''
-    for key in TRAIN_FLOAT_KEYS:
-        if key in config and config[key] is not None:
-            if key == "shift_value" and isinstance(config[key], str) and config[key].strip().lower() == "auto":
-                continue
-            config[key] = float(config[key])
-    for key in TRAIN_INT_KEYS:
-        if key in config and config[key] is not None:
-            config[key] = int(config[key])
-    if "low_k_correction_modes" in config and config["low_k_correction_modes"] is not None:
-        value = config["low_k_correction_modes"]
-        if isinstance(value, str):
-            value = value.strip()
-            if value.isdigit():
-                value = int(value)
-        config["low_k_correction_modes"] = value
-    return config
-
-
-def prepare_training_config(cfg: DictConfig | dict) -> dict:
-    '''Resolve Hydra config into the flat public training contract.'''
-    config = coerce_training_config_types(flatten_hydra_config(cfg))
-    config.setdefault("randomize_train_windows", True)
-
-    if config.get("representation") is None:
-        config["representation"] = (
-            "displacement" if bool(config.get("displacement", False)) else "raw_coords"
-        )
-    config["representation"] = canonical_representation(config["representation"])
-    config["displacement"] = config["representation"] == "displacement"
-    config["geo_loss"] = ",".join(parse_geo_loss_modes(config.get("geo_loss", "idct_ca-ca")))
-    config["freq_normalization"] = canonical_freq_normalization(config.get("freq_normalization", "auto"))
-    config["dc_residualization"] = canonical_dc_residualization(config.get("dc_residualization", "auto"))
-    config["aniso_source"] = canonical_aniso_source(config.get("aniso_source", "auto"))
-
-    if config.get("date_prefix_checkpoint_dir", True) and config.get("checkpoint_dir"):
-        base = str(config["checkpoint_dir"])
-        parent = os.path.dirname(base)
-        name = os.path.basename(base)
-        config["checkpoint_dir"] = os.path.join(parent, f"{date_str}_{name}")
-
-    checkpoint_dir = config.get("checkpoint_dir")
-    if checkpoint_dir is None:
-        raise ValueError("core.checkpoint_dir must be provided in the Hydra config.")
-
-    if config.get("run_name") is None:
-        run_name = f"{date_str}_top_k{config.get('top_k_freqs', '?')}"
-    else:
-        run_name = f"{date_str}_{config['run_name']}"
-    if bool(config.get("test_only", False)):
-        run_name = f"TEST_{run_name}"
-    config["run_name"] = run_name
-    return config
-
-
 def _filter_train_kwargs(config: dict, *, rank: int = 0) -> dict:
     accepted = set(inspect.signature(TRAIN_DISTRIBUTED).parameters)
     ignored = sorted(k for k in config if k not in accepted)
@@ -2404,21 +2324,34 @@ def _filter_train_kwargs(config: dict, *, rank: int = 0) -> dict:
     return {key: value for key, value in config.items() if key in accepted}
 
 
-@hydra.main(version_base=None, config_path="../../configs", config_name="spec_conv_displacement_ca_unit_var")
+@hydra.main(version_base="1.3", config_path="../../configs/hydra", config_name="dynamode_conf")
 def main(cfg: DictConfig) -> None:
     '''
     Hydra training entrypoint.
 
     Example:
-        torchrun --nproc_per_node=4 -m dynamode.train --config-name transformer_displacement_ca
+        torchrun --nproc_per_node=4 -m dynamode.train \
+            experiment=base_ca
     '''
+    config = prepare_training_config(
+        cfg,
+        config_choices=HydraConfig.get().runtime.choices,
+        task_overrides=HydraConfig.get().overrides.task,
+        resolve_identity=False,
+    )
     init_process()
     rank = dist.get_rank()
-    config = prepare_training_config(cfg)
+    config = _synchronize_runtime_identity(config, rank=rank)
     checkpoint_dir = config["checkpoint_dir"]
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     if rank == 0:
+        write_run_metadata(
+            checkpoint_dir,
+            cfg,
+            config,
+            HydraConfig.get().overrides.task,
+        )
         print("Run Name:", config["run_name"])
         wandb.login()
 
@@ -2436,8 +2369,6 @@ def main(cfg: DictConfig) -> None:
             resume="allow",
         )
 
-        with open(os.path.join(checkpoint_dir, "run_config.yaml"), "w") as f:
-            yaml.safe_dump(config, f, sort_keys=False)
         print("Final config:")
         pprint(config, sort_dicts=True, indent=4)
 

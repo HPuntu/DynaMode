@@ -1,0 +1,15 @@
+# @package _global_
+defaults:
+  - /run: default
+  - /core: base
+  - /data: mdcath_zarr
+  - /representation: displacement_ca_dct
+  - /model: spec_conv_base
+  - /diffusion: cosine_low_first
+  - /sampling: default
+  - /inference: default
+  - /training: base
+  - _self_
+
+run:
+  setup_tags: [unit-var]

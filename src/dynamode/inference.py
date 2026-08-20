@@ -21,7 +21,7 @@ from typing import Any, Iterable
 import hydra
 import numpy as np
 import torch
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 
 REPO = Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
@@ -32,6 +32,7 @@ try:
 except ModuleNotFoundError:  # Keep the module importable in minimal test envs.
     md = None
 
+from dynamode.config import load_run_manifest, split_inference_config
 from dynamode.minimiser import minimise_ca
 from dynamode.model.stack import build_model_stack
 from dynamode.model.shake import shake_caca
@@ -329,11 +330,11 @@ def load_inference_config(
     evaluation = _evaluation()
     config: dict[str, Any] = {}
     if config_path:
-        config.update(evaluation.flatten_yaml_config(config_path))
+        config.update(load_run_manifest(config_path))
     elif checkpoint_dir:
-        candidate = Path(checkpoint_dir) / "run_config.yaml"
+        candidate = Path(checkpoint_dir) / "run_manifest.yaml"
         if candidate.exists():
-            config.update(evaluation.flatten_yaml_config(str(candidate)))
+            config.update(load_run_manifest(candidate))
 
     config = evaluation.coerce_config_types(config)
     if checkpoint_dir is not None:
@@ -433,7 +434,7 @@ class Inference:
     """Unified high-level inference wrapper.
 
     Example:
-        ``runner = Inference(config_path="run_config.yaml", checkpoint_path="best_model.pt")``
+        ``runner = Inference(config_path="run_manifest.yaml", checkpoint_path="best_model.pt")``
         ``result = runner.generate_from_pdb("input.pdb", frames=750, post_minimise=True)[0]``
     """
 
@@ -856,51 +857,22 @@ def export_trajectory(coords: torch.Tensor, topology: Any, output_prefix: str = 
     traj.save_xtc(str(prefix.with_suffix(".xtc")))
 
 
-INFERENCE_RUNTIME_KEYS = {
-    "batch_size",
-    "crop_size",
-    "coords_type",
-    "include_angles",
-    "num_ode_steps",
-    "guidance_scale",
-}
-
-
-def flatten_hydra_config(cfg: DictConfig | dict) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Split a Hydra config into model/runtime config and inference controls."""
-    raw = OmegaConf.to_container(cfg, resolve=True) if isinstance(cfg, DictConfig) else dict(cfg)
-    raw = raw or {}
-    inference_cfg = dict(raw.get("inference") or {})
-    model_config: dict[str, Any] = {}
-    for key, value in raw.items():
-        if key in {"hydra", "inference"}:
-            continue
-        if isinstance(value, dict):
-            model_config.update(value)
-        else:
-            model_config[key] = value
-
-    for key in INFERENCE_RUNTIME_KEYS:
-        value = inference_cfg.get(key)
-        if value is not None:
-            model_config[key] = value
-    return model_config, inference_cfg
-
-
 def _required_inference_path(value: str | None, key: str) -> str:
     if value is None or str(value).strip() == "":
         raise ValueError(f"Provide inference.{key}=... in the Hydra config or override.")
     return str(value)
 
 
-@hydra.main(version_base=None, config_path="../../configs", config_name="spec_conv_displacement_ca_unit_var")
+@hydra.main(version_base="1.3", config_path="../../configs/hydra", config_name="dynamode_conf")
 def main(cfg: DictConfig) -> None:
     """Hydra inference entrypoint.
 
     Example:
-        python -m dynamode.inference inference.input=target.pdb inference.outdir=outputs
+        python -m dynamode.inference \
+            experiment=base_ca \
+            inference.input=target.pdb inference.outdir=outputs
     """
-    model_config, inference_cfg = flatten_hydra_config(cfg)
+    model_config, inference_cfg = split_inference_config(cfg)
     input_path = _required_inference_path(inference_cfg.get("input"), "input")
     outdir = Path(_required_inference_path(inference_cfg.get("outdir"), "outdir"))
 

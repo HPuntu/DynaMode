@@ -1,0 +1,7 @@
+# Null selects an automatic directory below run.output_root. Set an exact path
+# to bypass automatic naming or to resume an existing run.
+checkpoint_dir: null
+checkpoint_path: null
+resume_from_latest: false
+model_type: spectral_conv_block_mix_amplitude
+epochs: 300

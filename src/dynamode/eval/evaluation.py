@@ -27,14 +27,13 @@ import os
 import random
 import time
 from datetime import datetime, timedelta
-from pathlib import Path
 from pprint import pprint
 import concurrent.futures
 import numpy as np
 import torch
 import torch.distributed as dist
-import yaml
 
+from dynamode.config import load_run_manifest
 from dynamode.dataloader.features import (
     DSSP_STATES,
     dssp_to_onehot,
@@ -117,16 +116,6 @@ def shard_items(items, rank: int, world_size: int):
     return items[rank::world_size]
 
 
-def flatten_yaml_config(path: str) -> dict:
-    raw = yaml.safe_load(open(path)) or {}
-    config = {}
-    for key, value in raw.items():
-        if isinstance(value, dict):
-            config.update(value)
-        else:
-            config[key] = value
-    return config
-
 def coerce_config_types(config: dict) -> dict:
     float_keys = [
         "min_snr_gamma", "shift_value", "guidance_scale", "aniso_gamma",
@@ -191,7 +180,7 @@ def resolve_base_config_path(args: argparse.Namespace) -> str | None:
         "checkpoint_dir": args.checkpoint_dir,
         "checkpoint_path": args.checkpoint_path,
     })
-    candidate = os.path.join(checkpoint_dir, "run_config.yaml")
+    candidate = os.path.join(checkpoint_dir, "run_manifest.yaml")
     if os.path.exists(candidate):
         return candidate
     return None
@@ -2590,7 +2579,12 @@ def parse_args() -> dict:
     parser = argparse.ArgumentParser(description="Unified test-set evaluation for DynaMode checkpoints.")
     
     # Core
-    parser.add_argument("--config", type=str, default=None)
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to a DynaMode run_manifest.yaml.",
+    )
     parser.add_argument("--checkpoint_path", type=str, default=None)
     parser.add_argument("--checkpoint_dir", type=str, default=None)
     parser.add_argument("--run_name", type=str, default=None)
@@ -2737,7 +2731,7 @@ def parse_args() -> dict:
     config = {}
     base_config_path = resolve_base_config_path(args)
     if base_config_path is not None and os.path.exists(base_config_path):
-        config.update(flatten_yaml_config(base_config_path))
+        config.update(load_run_manifest(base_config_path))
         
     config = coerce_config_types(config)
     config.update({k: v for k, v in vars(args).items() if v is not None and k != "config"})

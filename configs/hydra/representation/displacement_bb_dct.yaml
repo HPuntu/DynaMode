@@ -1,0 +1,8 @@
+representation: displacement
+coords_type: bb
+window_size: 256
+top_k_freqs: 256
+use_DCT: true
+freq_normalization: auto
+dc_residualization: auto
+aniso_source: auto

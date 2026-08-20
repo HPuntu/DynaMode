@@ -1,0 +1,15 @@
+# Primary Hydra composition entry point for DynaMode.
+defaults:
+  - experiment: base_ca
+  - override hydra/job_logging: disabled
+  - override hydra/hydra_logging: disabled
+  - _self_
+
+# DynaMode's existing trainer owns checkpoint paths and rank-zero logging.
+# Keep Hydra from changing directories or creating competing per-rank outputs.
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: .
+  output_subdir: null

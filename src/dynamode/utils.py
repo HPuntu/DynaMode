@@ -7,7 +7,6 @@ import numpy as np
 from sklearn.model_selection import StratifiedGroupKFold
 import glob
 import mdtraj as md
-import yaml
 import torch
 
 
@@ -302,58 +301,6 @@ def build_spectral_mask(mask, torsion_mask, top_k, channels, is_dct):
         full = feature_mask.unsqueeze(2).unsqueeze(-1).expand(-1, -1, top_k, -1, 2)
         return full.reshape(feature_mask.shape[0], feature_mask.shape[1], -1)
 
-
-def flatten_yaml_config(path):
-    raw = yaml.safe_load(open(path)) or {}
-    config = {}
-    for key, value in raw.items():
-        if isinstance(value, dict):
-            config.update(value)
-        else:
-            config[key] = value
-    return config
-
-
-def read_config(config_path):
-
-    config = {}
-    if config_path is not None:
-        if not os.path.exists(config_path):
-            raise FileNotFoundError(config_path)
-        config.update(flatten_yaml_config(config_path))
-
-    # Type coercions for YAML
-    for float_key in ["max_lr", "min_snr_gamma", "smoothing_sigma", "shift_value", "guidance_scale", "shelf_value", "coord_scale", "bending_lambda", "geometry_lambda", "aniso_gamma", "rmsf_lambda", "dc_lambda"]:
-        if float_key in config and config[float_key] is not None:
-            if float_key == "shift_value" and isinstance(config[float_key], str) and config[float_key].strip().lower() == "auto":
-                continue
-            config[float_key] = float(config[float_key])
-    for int_key in ["epochs", "batch_size", "num_workers", "top_k_freqs", "hidden_dim", "freq_hidden_size",
-                        "spectral_modes",
-                        "seq_embed_dim",
-                        "ss_embed_dim",
-                        "num_layers", "num_heads", "num_steps",
-                        "num_ode_steps", "max_val_batches",
-                        "geometry_warmup_start", "geometry_warmup_epochs",
-                        "geometry_decay_start", "geometry_decay_epochs",
-                        "rmsf_warmup_start", "rmsf_warmup_epochs",
-                        "dc_start_epoch",
-                        "prefetch_factor", "dataloader_timeout",
-                        "diagnostic_low_k_modes", "band_low_modes", "band_mid_modes",
-                        "rmsf_position_bins", "diversity_samples", "diversity_batches", "diversity_seed"]:
-        if int_key in config:
-            config[int_key] = int(config[int_key])
-
-    if "low_k_correction_modes" in config and config["low_k_correction_modes"] is not None:
-        value = config["low_k_correction_modes"]
-        if isinstance(value, str):
-            value = value.strip()
-            if value.isdigit():
-                value = int(value)
-        config["low_k_correction_modes"] = value
-
-
-    return config
 
 def ca_bond_lengths(coords, eps=1e-8):
     '''Computes adjacent Ca-Ca bond lengths'''

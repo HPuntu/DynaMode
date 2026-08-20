@@ -1,0 +1,13 @@
+# Root for automatically date-partitioned DynaMode run directories.
+output_root: /projects/u6ji/hew/dynamode_runs
+
+# Set core.checkpoint_dir for an exact directory, especially when resuming.
+timestamp_run_dir: true
+run_tag: null
+experiment_handle: null
+setup_handle: null
+
+# Resume restores the prior resolved config from run_manifest.yaml. Operational
+# overrides are allowed; scientific/model overrides require the unsafe switch.
+resume_config_mode: restore
+resume_allow_unsafe_overrides: false
